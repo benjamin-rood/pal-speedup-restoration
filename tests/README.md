@@ -1,16 +1,27 @@
 # Tests
 
-All tests run on synthetic 25 fps media generated locally; nothing is downloaded.
+All tests run on synthetic 25 fps media generated locally; nothing is downloaded. Scratch
+directories must not be inside the repository.
 
 ```bash
-F=/some/scratch/dir                      # must not be inside the repository
+F=/some/scratch/dir
+# Main set: the common shapes of PAL-speedup releases.
 tests/make_fixtures.sh "$F"              # ~10 s, about 200 MB
 ./pal_restore.py restore "$F"            # expect: 8 restored, 1 skipped, 0 failed
 tests/check_outputs.sh "$F"              # independent checks; every line PASS, exit 0
 mkdir -p "$F/fail" && uv run -q --with numpy python tests/failure_path.py "$F" "$F/fail"
+
+# Adversarial set: cases earlier versions got wrong (docs/decisions.md section 6).
+A=/some/other/scratch/dir
+tests/make_adversarial.sh "$A"           # ~5 s
+./pal_restore.py restore "$A" > "$A/restore.log" 2>&1   # expect: 15 restored, 0 failed
+tests/check_adversarial.sh "$A"          # reads $A/restore.log; every line PASS, exit 0
+
+# Command line: missing inputs, collisions, bad options, symlinks, SIGTERM.
+tests/check_cli.sh /some/new/scratch/dir # must not exist; every line PASS, exit 0
 ```
 
-| Fixture | Exercises |
+| Fixture (main set) | Exercises |
 |---|---|
 | `h264.mkv` (+ `.srt`, `.en.srt`, `.en.vtt`, `.ass` sidecars) | H.264, two audio tracks (16-bit FLAC, 5.1 AC-3), embedded SRT, chapters, sidecar retiming |
 | `dvd.mpg` | MPEG-2 program stream, AC-3 starting 0.3 s after the video |
@@ -22,7 +33,26 @@ mkdir -p "$F/fail" && uv run -q --with numpy python tests/failure_path.py "$F" "
 | `angles.mkv` | two MPEG-2 video tracks, font attachment |
 | `film.mkv` | 23.976 fps input, must be skipped |
 
-`check_outputs.sh` checks what `pal_restore.py` does not check about itself: decoded frames
-bit-identical to the input (no re-encode), the H.264 SPS / MPEG-2 sequence header timing
-fields, and exact sidecar timestamps (including that ASS dialogue text and CRLF line endings
-are untouched).
+| Fixture (adversarial set) | Exercises |
+|---|---|
+| `mixed.ts` | H.264 + HEVC video, clock starting at 50 000 s: both tracks must start together |
+| `dvb.ts`, `dvbbig.ts` | DVB bitmap subtitles; the second with a clock at 50 000 s (timeline must start near 0) |
+| `vobsub.vob` | DVD shape: MPEG-2, two AC-3, DVD subpictures in MPEG-PS |
+| `late2.vob` | second AC-3 track starting 20 s in (deep probe) |
+| `dvdrip.mkv` | VobSub in Matroska |
+| `lead.mkv` | audio 0.5 s before the video, embedded text subtitles |
+| `hires.mkv` | 96 kHz 24-bit FLAC with content to 48 kHz (band must be kept) |
+| `xvid.avi` | MPEG-4 Part 2 with B-frames, no presentation times in the packets |
+| `edit.mp4` | video offset 2 s by an edit list, MP4 text subtitles, chapters |
+| `flags.mkv` | `pt-BR` language, track name, commentary and default flags |
+| `cover.mp4` | cover art (must become an attachment, not a video track) |
+| `vp9.webm` | VP9 + Opus |
+| `sidecars/` | `film.mkv`, `film.part2.mkv` and eleven adversarial sidecars: `.` separator, short fractions, UTF-16, hours 1/10/100, timestamp in text, ASS reordered Format, ASS hours 10, SSA `Marked=`, VTT header/NOTE/cue settings, upper-case extension, `film.part2.srt` ownership |
+
+`tests/mkvobsub.py` writes the small VobSub pair the bitmap-subtitle fixtures are made from.
+
+`check_outputs.sh` and `check_adversarial.sh` check what `pal_restore.py` does not check about
+itself: decoded frames bit-identical to the input (no re-encode), bitstream timing fields, exact
+sidecar text, audio band, track properties, and the specific defects each adversarial case was
+made for. Run against the outputs of commit `ff4f58a` (before the round-1 fixes),
+`check_adversarial.sh` reports 23 failures, so its checks can fail.

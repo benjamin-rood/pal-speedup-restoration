@@ -12,7 +12,7 @@ Because no frames were added, dropped or blended, nothing needs to be inverse-te
 | Audio (every track) | Resampled by exactly 24000/25025, restoring original speed **and** pitch together | Yes, to FLAC (lossless from the decoded audio) by default |
 | Embedded subtitles (text and image) | Timestamps scaled by 25025/24000 | No |
 | Chapters | Times scaled by 25025/24000 | No |
-| Sidecar `.srt` / `.ass` / `.ssa` / `.vtt` next to the input | Timestamps scaled by 25025/24000 (ASS: only event Start/End fields) | No (byte-level edit, encoding preserved) |
+| Sidecar `.srt` / `.ass` / `.ssa` / `.vtt` next to the input | Timestamps scaled by 25025/24000 (SRT/VTT: only cue timing lines; ASS/SSA: only event Start/End fields, located by the `[Events]` Format line) | No (text edit; encoding, byte-order mark and line endings preserved) |
 
 The duration of each file increases by a factor of 25025/24000 ≈ 1.042708 (a 96:00 film becomes 100:06).
 
@@ -33,7 +33,7 @@ If you are an agent executing this document: never run interactive or never-term
 - Never modify, move or overwrite an input file.
 - Never re-encode video.
 - Outputs go to a `restored/` directory next to each input (or a directory given with `--out-dir`), as `<base>.mkv`, keeping the input's base name so other tools (for example the subtitle pipeline's `<base>.<lang>.srt` convention) continue to match.
-- A restored file is only moved into place after its verification passes. A failed file leaves nothing behind.
+- A restored file and its retimed sidecars are moved into place together, only after all of them pass verification. A failed file leaves nothing behind (an interrupted or killed run included).
 - Existing outputs are never overwritten; the file is reported as skipped.
 - Record every deviation from this document and the reason.
 
@@ -99,22 +99,25 @@ The script starts with `#!/usr/bin/env -S uv run --script` and declares its depe
 
 For each input:
 
-1. **Probe.** Files whose video is not 25 fps are skipped.
+1. **Probe.** Files whose video is not 25 fps are skipped. Probing reads up to 100 s / 100 MB, so streams that start late (a second DVD audio track) are found and described.
+   **Working file.** A Matroska input is used as it is. Any other input (MP4, MPEG-TS, MPEG-PS/VOB, AVI, …) is first copied by FFmpeg, every stream unchanged, into a Matroska working file in the temporary directory, and every later step reads only that file. FFmpeg shifts all streams by the same amount so the file starts at 0 (capture clocks start anywhere, often at tens of thousands of seconds), gives packets without a presentation time one (AVI with B-frames), and carries DVB and DVD subpicture subtitles, which mkvmerge cannot read from MPEG-TS/PS. MP4 text subtitles become SRT text (Matroska cannot hold them as they are; mkvmerge stores them the same way), and MP4 cover art becomes a Matroska `cover.png`/`cover.jpg` attachment instead of a video track. Without this step, tracks mkvmerge read from a transport stream (which it rebases) and tracks FFmpeg copied (which keep the capture clock) could land hours apart.
 2. **Audio.** Each audio track is decoded and passed through:
    ```text
    aresample=50050:resampler=soxr:precision=28,asetrate=48000,aresample=<original rate>:resampler=soxr:precision=28
    ```
-   Resampling to 50050 Hz and relabelling as 48000 Hz slows the audio by exactly 50050/48000 = 25025/24000 and lowers the pitch by the same ratio. The two integer rates are required because `asetrate` only accepts integers; the ratio is exact for every source sample rate (48 kHz, 44.1 kHz, 32 kHz and so on). The final resample returns to the track's original sample rate.
+   Resampling to 50050 Hz and relabelling as 48000 Hz slows the audio by exactly 50050/48000 = 25025/24000 and lowers the pitch by the same ratio. The two integer rates are required because `asetrate` only accepts integers; the ratio is exact for every source sample rate. The relabelled rate is the smallest multiple of 24000 not below the source rate (48000 for sources up to 48 kHz; 96000, i.e. `aresample=100100 … asetrate=96000`, for 96 kHz), so the first resample never narrows the band. The final resample returns to the track's original sample rate.
    The existing offset between audio and video is preserved and scaled. Audio that started before the first video frame is trimmed sample-accurately in FFmpeg, because a negative `mkvmerge --sync` can only drop whole codec blocks.
-   Language, track title and default flag are carried over. With `--audio-codec opus`, a 5.1(side) or 5.0(side) layout is relabelled 5.1 / 5.0 (same speakers, the label libopus accepts; no remixing).
+   Language (with region, e.g. `pt-BR`), track name, and the default, forced, commentary, hearing-impaired, visual-impaired, original and text-descriptions flags are carried over. With `--audio-codec opus`, a 5.1(side) or 5.0(side) layout is relabelled 5.1 / 5.0 (same speakers, the label libopus accepts; no remixing).
 3. **Video.** Two separate operations:
    - *Bitstream frame rate.* H.264 and MPEG-2 tracks are copied (no decoding) through FFmpeg's `h264_metadata=tick_rate=48000/1001` or `mpeg2_metadata=frame_rate=24000/1001` bitstream filter into an intermediate Matroska file that keeps the source timestamps (`-copyts`). This rewrites every SPS / sequence header, including those repeated in-band in transport streams. Other codecs are taken from the source as they are.
    - *Timestamps.* `mkvmerge --sync <tid>:0,25025/24000` multiplies every video timestamp by the ratio, exactly as for subtitles; mkvmerge then also records the 1001/24000 s default frame duration.
    `mkvmerge --default-duration` is deliberately not used to retime: it rewrites the timestamps of Matroska/MP4 input but not of MPEG-TS input (which would leave TS video at 25 fps under 23.976 fps audio), and combined with `--sync` it stretches Matroska input twice. See `docs/decisions.md`.
 4. **Subtitles and chapters.** `mkvmerge --sync <tid>:0,25025/24000` scales every embedded subtitle track; `--chapter-sync 0,25025/24000` scales the chapters (passed only when the input has chapters). Attachments (fonts) and global tags are copied.
    Steps 3 and 4 are one mkvmerge pass. The audio from step 2 is added in a second pass, each track placed relative to where the first video frame actually landed in the first pass.
-5. **Verify** (section 6). Only on success is the output moved from its temporary directory into place.
-6. **Sidecars.** Files next to the input named `<base>.srt`, `<base>.<anything>.srt` (and `.ass`, `.ssa`, `.vtt`) are retimed into the output directory under the same names.
+5. **Verify** (section 6).
+6. **Sidecars.** Files next to the input named `<base>.srt`, `<base>.<anything>.srt` (and `.ass`, `.ssa`, `.vtt`, any letter case) are retimed into the temporary directory and each is verified: FFmpeg decodes the original and the retimed file, and every cue must be the original's × 25025/24000 within 10 ms. A sidecar that also matches a sibling video with a longer base name (`film.part2.srt` next to `film.part2.mkv`) belongs to that video only.
+   Text is decoded by its byte-order mark (UTF-8, UTF-16) and written back the same way. Only timing is changed: in SRT/VTT the two timestamps of a cue timing line (`,` or `.` before the fraction, 1–3 fraction digits read as FFmpeg reads them, any number of hour digits); cue text, `NOTE` blocks and the WebVTT header are untouched. In ASS/SSA, the Start and End fields of `Dialogue`/`Comment` lines, located by the `[Events]` Format line.
+7. **Publish.** Only when the MKV and every sidecar pass are they moved into place: sidecars first, the MKV last, so an interruption leaves no MKV and a re-run redoes the file. If the MKV already exists, a re-run still retimes any sidecar whose output is missing (one added later, or one that failed before).
 
 ---
 
@@ -131,9 +134,12 @@ The script refuses to publish an output unless all of these hold:
 | Video duration | Measured from the timestamps (first to last frame plus one frame period): input × 25025/24000, within 50 ms |
 | A/V sync | Each audio track's end, measured from the video start, equals the input's × 25025/24000 within 100 ms |
 | Audio start | Input start offset × 25025/24000 (or 0 if it was trimmed), within 50 ms |
-| Pitch | Measured shift between input and output audio is −72.4 cents ± 8 cents (log-spectrum cross-correlation over three excerpts) |
+| Pitch | Measured shift between input and output audio is −72.4 cents ± 8 cents (log-spectrum cross-correlation over three excerpts within the track's own span) |
 | Subtitles | Text tracks: decoded cues compared one by one — same cue count, every cue's start and end, relative to the first video frame, scaled within 10 ms (empty "clear" samples, which mkvmerge drops from MP4 text tracks, are not cues). Image tracks (PGS, VobSub, DVB): same packet count; first and last scaled within 10 ms |
-| Chapters | Same count; each start scaled within 10 ms |
+| Chapters | Same count; each start, relative to the first video frame, scaled within 10 ms |
+| Video track offsets | Every further video track's start, relative to the first video track's, is the input's × 25025/24000 within 50 ms |
+| Timeline start | The output starts at most the input's lead before its first video frame (× 25025/24000) plus 0.2 s (B-frame reorder delay); it never carries a capture's clock |
+| Sidecars | Every cue FFmpeg decodes from the original appears in the retimed file × 25025/24000 within 10 ms; same cue count |
 
 The pitch check confirms the audio was slowed in the right direction by the right amount. It cannot judge whether the original is musically correct; that is what section 8's listening check is for.
 
@@ -152,8 +158,9 @@ restore [--target-fps 24000/1001] [--audio-codec flac|opus] [--opus-kbps-per-cha
         [--out-dir DIR] [--dry-run] PATH...
 ```
 
-- `PATH` may be files or directories. Directories are searched recursively for `.mkv .mp4 .m4v .mov .avi .mpg .mpeg .vob .ts .m2ts .mts .webm`; existing `restored/` directories are not descended into.
-- `--target-fps` defaults to `24000/1001`. Use `24` only for material known to come from a true 24.000 fps master.
+- `PATH` may be files or directories. Directories are searched recursively for `.mkv .mp4 .m4v .mov .avi .mpg .mpeg .vob .ts .m2ts .mts .webm`; existing `restored/` directories, the `--out-dir` directory and the script's own temporary directories (`pal-restore-*`) are not descended into. A path that does not exist counts as a failed file. A symbolic link is restored under its own name, next to itself, with its own sidecars.
+- Two inputs that would write the same output (`x.mkv` and `x.mp4` in one directory, or the same base name in two directories with one `--out-dir`) both fail with a message naming the other; restore them separately with different `--out-dir`.
+- `--target-fps` defaults to `24000/1001`. Use `24` only for material known to come from a true 24.000 fps master. It must be a number or fraction between 0 and 25.
 - `--audio-codec flac` (default) is lossless relative to the decoded source audio. `opus` uses `--opus-kbps-per-channel` × channels (default 96 kb/s per channel, 576 kb/s for 5.1) and outputs 48 kHz.
 - `--out-dir` writes all outputs to one directory instead of `restored/` next to each input.
 - `--dry-run` lists what would be written without doing anything.
@@ -204,7 +211,7 @@ Preview, then run:
 "$HOME/ai/pal-restore/pal_restore.py" restore "/path/to/videos" 2>&1 | tee "$HOME/ai/pal-restore/run-$(date +%Y%m%d-%H%M%S).log"
 ```
 
-The batch continues past individual failures and ends with a summary line (`N restored, N skipped, N failed`). It exits non-zero if any file failed. Re-running the same command later only processes files whose outputs do not exist yet.
+The batch continues past individual failures and ends with a summary line (`N restored, N skipped, N failed`). It exits non-zero if any file failed. Re-running the same command later only processes files whose outputs (MKV or sidecars) do not exist yet. Stopping it with Ctrl-C or `kill` leaves nothing of the file in progress behind.
 
 ---
 

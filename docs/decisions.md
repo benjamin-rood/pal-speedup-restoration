@@ -57,8 +57,8 @@ the first video frame is still trimmed sample-accurately, as pipeline.md section
   private data would miss.
 - **All video tracks** are checked, not only the first (multi-angle MPEG-2 fixture).
 - **Display aspect ratio** is compared, because rewritten tracks pass through an intermediate
-  file; `video_track_options` carries `display_dimensions`, language, name, default and forced
-  flags across.
+  file; `track_options` carries `display_dimensions`, language, name, default, forced and
+  accessibility flags across.
 - **Text subtitles** are compared by decoded cues (FFmpeg → SRT): MP4 text tracks hold empty
   "clear" samples between cues (6 packets for 3 cues in the fixture) which mkvmerge drops, so the
   draft's packet count failed a correct output. Every cue is now checked, not just first/last.
@@ -90,4 +90,97 @@ the first video frame is still trimmed sample-accurately, as pipeline.md section
   rewrite to MPEG-2 and H.264; `hevc_metadata` could extend it if such sources appear.
 - **Opus encoder delay** shows as a ~7 ms earlier first packet timestamp (Opus pre-skip, 312
   samples). Decoded audio is placed correctly; it is well inside the 50 ms start tolerance.
-- **Language codes**: mkvmerge writes the legacy Matroska form (`ger` for `deu`); same language.
+- **Language codes**: mkvmerge writes the legacy Matroska form (`ger` for `deu`) next to the
+  IETF tag; same language.
+- **A sidecar whose cue text contains a complete timing line** (`12:30:00,000 --> 12:31:00,000`
+  inside a cue) is read by FFmpeg as an extra cue but is not retimed (it is text). Sidecar
+  verification sees the disagreement and the file fails, publishing nothing. The file is
+  ambiguous; refusing it is the right outcome.
+- **WebVTT `X-TIMESTAMP-MAP`** is left as it is: it maps cue time to an HLS stream's MPEG-TS
+  clock, which has no meaning for a sidecar next to a Matroska file.
+
+## 6. Red-team round 1 (2026-10-09): one time base, sidecars as part of the published unit
+
+An independent red-team agent ran 40 adversarial inputs against commit `ff4f58a`. Every finding
+below was confirmed by running it, except where marked. Each is now a permanent test:
+`tests/make_adversarial.sh` + `tests/check_adversarial.sh` (media and sidecars), `tests/check_cli.sh`
+(command line), `tests/failure_path.py` (publishing). Run against `ff4f58a`'s outputs,
+`check_adversarial.sh` reports 23 failures; against the current code, none.
+
+1. **Tracks on different time bases.** mkvmerge rebases MPEG-TS/PS tracks it reads itself;
+   the bitstream-rewritten intermediates (FFmpeg, `-copyts`) kept the capture clock. A TS with
+   H.264 and HEVC video starting at 50 000 s gave video tracks 52 136.9 s apart and passed
+   verification (only video 0 was checked); DVB subtitles came out 1.53 s early; a TS starting
+   at 50 000 s gave an output timeline starting at 52 136 s.
+   **Decision:** one time base. A non-Matroska input is first copied by FFmpeg, streams
+   unchanged, into a Matroska working file; every later step reads only that file
+   (`working_file`). This also fixes 5 and 10 below. Matroska input is used as is (both tools
+   keep its timestamps). Verification now also checks each further video track's start against
+   video 0, and the timeline start (pipeline.md section 6). The timeline check allows 0.2 s,
+   because Matroska cannot store negative timestamps and FFmpeg shifts a B-frame source later as
+   a whole by its reorder delay (80 ms measured on `cover.mp4`; x264's deepest is 120 ms).
+2. **Sidecars.** Not retimed: `.` before the milliseconds, 1–2 fraction digits, UTF-16 files,
+   ASS with a reordered Format line. Wrongly scaled: SRT/VTT hours ≥ 100, ASS hours ≥ 10.
+   Wrongly changed: timestamp-like text in cues, `NOTE` blocks, `X-TIMESTAMP-MAP`. Nothing
+   verified sidecars at all.
+   **Decision:** the retimer works on decoded text lines, not a byte regex over the file:
+   only cue timing lines (SRT/VTT) and the Start/End fields named by the `[Events]` Format line
+   (ASS/SSA) change; encoding is taken from the byte-order mark. Fractions of 1–3 digits are
+   read as a millisecond count, which is what FFmpeg does (confirmed: FFmpeg-decoded original
+   and retimed cues agree within 10 ms on the fixture). Every sidecar is verified by decoding
+   both files with FFmpeg (`verify_sidecar`).
+3. **96 kHz audio band-limited to 24 kHz.** The intermediate rate was fixed at 50 050 Hz.
+   Measured energy above 30 kHz: −35.8 dB in, −62.7 dB out. **Decision:** the relabelled rate
+   is the smallest multiple of 24 000 not below the source rate; now −35.8 → −37.1 dB.
+4. **Embedded text subtitles failed correct files** when the video was not the earliest
+   stream (audio leading by 0.5 s; MP4 edit list offsetting video by 2 s): FFmpeg's SRT output
+   was rebased to the earliest stream while packet times were absolute. **Decision:** cues are
+   decoded with `-copyts`, on the same absolute timestamps as everything else.
+5. **DVD subpictures in VOB/MPEG-PS always failed**: mkvmerge cannot read them from MPEG-PS.
+   **Decision:** fixed by 1 (FFmpeg copies them into the working file; mkvmerge reads them
+   from Matroska as VobSub).
+6. **Sidecars were outside the published unit**: a sidecar failure left the MKV published, and
+   a re-run never retimed sidecars that were missing or added later. **Decision:** sidecars are
+   retimed and verified in the temporary directory and published with the MKV, sidecars first
+   and MKV last; a re-run over an existing MKV retimes only the missing sidecars.
+7. **SIGTERM/SIGKILL left `pal-restore-*` directories**, and a later run with `--out-dir`
+   inside the input tree collected the stale intermediates as inputs. **Decision:** SIGTERM
+   raises `SystemExit`, taking Ctrl-C's cleanup path (exit 143, nothing left, child FFmpeg
+   killed by `subprocess.run`); `collect` never descends into `pal-restore-*`, `restored/` or
+   the `--out-dir` directory. SIGKILL cannot be caught; its leftover directory is now ignored.
+8. **Symlinked inputs** were resolved to the target's name and directory, losing the link's
+   sidecars. **Decision:** `.absolute()` instead of `.resolve()`.
+9. **Pitch excerpts were placed from 0**, not within the track, so late-starting tracks were
+   "not measurable". **Decision:** excerpts at 25/50/75 % of the track's own span, mapped to
+   the output through the same linear map as everything else, read with `-copyts -ss`.
+10. **AVI with B-frames**: packets carry no presentation time, the video start was taken as
+    0.08 s and 80 ms of audio was trimmed. **Decision:** fixed by 1 (`-fflags +genpts` in the
+    working file) and `packet_span` also generates missing times. The video start is now 0.04 s,
+    which is where FFmpeg's decoder presents the first frame, so the 40 ms of audio before it is
+    trimmed as pipeline.md section 5 step 2 requires.
+11. **Command line**: a missing input exited 0; two inputs writing the same output (`x.mkv` and
+    `x.mp4`, or one base name in two directories under one `--out-dir`) left the second
+    reported as "skipped: already exists", silently never restored; `verify` on a missing file and
+    a bad `--target-fps` (`abc`, `0`) gave tracebacks. **Decision:** a missing path counts as a
+    failed file; colliding inputs both fail with a message naming the other; `--target-fps`
+    must lie strictly between 0 and 25; `verify` reports a missing file and exits 2.
+12. **Smaller items.** A second DVD audio track starting 20 s in was probed with sample rate 0
+    (`aresample=0`): probing now reads 100 s / 100 MB, and an unknown sample rate is an explicit
+    error. `pt-BR` was written as `pt`: audio properties now come from mkvmerge's
+    `language_ietf` through the same `track_options` as video, which also carries the
+    commentary and other accessibility flags. `film.part2.srt` was claimed by `film.mkv`
+    (found by inspection): a sidecar belongs to the sibling video with the longest matching
+    base name.
+
+Found while fixing these, also corrected:
+
+- `first_decoded_pts` read one packet; when that packet is all AAC encoder priming the decoder
+  outputs nothing, and the old code silently returned 0.0. It now reads eight packets and raises
+  if none decodes.
+- MP4 text subtitles cannot be copied into Matroska as they are; the working file converts them
+  to SRT text (timing unchanged; mkvmerge stores them the same way when it reads MP4 itself).
+- MP4 cover art would be copied as a real video track; it becomes a Matroska `cover.png`/`cover.jpg`
+  attachment.
+- `tests/failure_path.py` passed whatever the code did once `restore_one` took the destination
+  file instead of the directory; it was rewritten against the new signature and extended to
+  the sidecar failure and the re-run cases.
