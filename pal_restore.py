@@ -8,11 +8,15 @@
 Every original frame is still present in a PAL-speedup release; only the timing and the
 audio were changed. This tool:
 
-  * relabels the video timing 25 -> 24000/1001 without re-encoding (video is untouched),
+  * stretches the video timestamps by 25025/24000 and rewrites the frame rate in H.264 SPS and
+    MPEG-2 sequence headers to 24000/1001, without re-encoding (frames are untouched),
   * resamples every audio track by exactly 24000/25025 (restores both speed and pitch),
   * scales embedded subtitle and chapter times by 25025/24000,
   * scales sidecar subtitle files (.srt/.ass/.ssa/.vtt) next to the input,
-  * verifies frame count, durations, A/V offset, subtitle/chapter timing and pitch.
+  * verifies frame rate (container and bitstream), frame count, durations, A/V offset,
+    subtitle/chapter timing and pitch before publishing anything.
+
+See docs/pipeline.md for the procedure and docs/decisions.md for why it works as it does.
 
 Subcommands:
   doctor                          check required tools
@@ -77,8 +81,8 @@ def stream_fps(stream: dict) -> Fraction | None:
     return None
 
 
-def packet_span(path: Path, selector: str) -> tuple[float, float, int]:
-    """(first pts, end of last packet, packet count) for one stream, from demuxed packets."""
+def packet_span(path: Path, selector: str) -> tuple[float, float, float, int]:
+    """(first pts, last pts, end of last packet, packet count) for one stream, from demuxed packets."""
     out = capture(["ffprobe", "-v", "error", "-select_streams", selector,
                    "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)])
     pts, ends = [], []
@@ -91,8 +95,8 @@ def packet_span(path: Path, selector: str) -> tuple[float, float, int]:
         pts.append(p)
         ends.append(p + d)
     if not pts:
-        return (math.nan, math.nan, 0)
-    return (min(pts), max(ends), len(pts))
+        return (math.nan, math.nan, math.nan, 0)
+    return (min(pts), max(pts), max(ends), len(pts))
 
 
 def first_decoded_pts(path: Path, selector: str) -> float:
@@ -105,6 +109,75 @@ def first_decoded_pts(path: Path, selector: str) -> float:
             if f.get(key) not in (None, "N/A"):
                 return float(f[key])
     return 0.0
+
+
+MPEG2_FRAME_RATES = {1: Fraction(24000, 1001), 2: Fraction(24), 3: Fraction(25), 4: Fraction(30000, 1001),
+                     5: Fraction(30), 6: Fraction(50), 7: Fraction(60000, 1001), 8: Fraction(60)}
+_TRACE_LINE = re.compile(r"^\[trace_headers[^]]*\]\s+\d+\s+(\w+)\s.*=\s*(-?\d+)\s*$")
+
+
+def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | None:
+    """Frame rate declared by every sequence-level header of one video track, in stream order.
+
+    H.264: every SPS (in the codec private data and in-band) whose VUI carries timing info;
+    rate = time_scale / (2 * num_units_in_tick). MPEG-2: every sequence header, with its
+    sequence extension. Returns None for codecs whose headers are not checked.
+    """
+    if codec == "h264":
+        units, start = "7", "seq_parameter_set_id"
+    elif codec == "mpeg2video":
+        units, start = "0xb3|0xb5", "frame_rate_code"
+    else:
+        return None
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "debug", "-i", str(path),
+                          "-map", f"0:v:{vindex}", "-c", "copy",
+                          "-bsf:v", f"filter_units=pass_types={units},trace_headers", "-f", "null", "-"],
+                         env=ENV, capture_output=True, text=True, check=True).stderr
+    headers: list[dict[str, int]] = []
+    for line in out.splitlines():
+        m = _TRACE_LINE.match(line)
+        if not m:
+            continue
+        name, value = m.group(1), int(m.group(2))
+        if name == start:
+            headers.append({})
+        if headers:
+            headers[-1][name] = value
+    rates = []
+    for h in headers:
+        if codec == "h264":
+            if h.get("timing_info_present_flag") and h.get("num_units_in_tick"):
+                rates.append(Fraction(h["time_scale"], 2 * h["num_units_in_tick"]))
+        else:
+            rate = MPEG2_FRAME_RATES.get(h["frame_rate_code"])
+            if rate is not None:
+                rates.append(rate * (h.get("frame_rate_extension_n", 0) + 1)
+                             / (h.get("frame_rate_extension_d", 0) + 1))
+    return rates
+
+
+def display_aspect(stream: dict) -> Fraction:
+    sar = stream.get("sample_aspect_ratio", "1:1")
+    sar = Fraction(*map(int, sar.split(":"))) if sar not in ("0:1", "N/A") else Fraction(1)
+    return Fraction(int(stream["width"]), int(stream["height"])) * sar
+
+
+_SRT_TIME = re.compile(r"(\d+):(\d{2}):(\d{2}),(\d{3}) --> (\d+):(\d{2}):(\d{2}),(\d{3})")
+
+
+def text_cues(path: Path, k: int) -> list[tuple[float, float]] | None:
+    """(start, end) of every cue of subtitle stream k, decoded by FFmpeg; None if the stream is
+    not text (FFmpeg cannot convert bitmap subtitles to SRT)."""
+    p = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", f"0:s:{k}",
+                        "-f", "srt", "-"], env=ENV, capture_output=True, text=True, errors="replace")
+    if p.returncode != 0:
+        return None
+    cues = []
+    for m in _SRT_TIME.finditer(p.stdout):
+        g = list(map(int, m.groups()))
+        cues.append((g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000,
+                     g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000))
+    return cues
 
 
 def audio_filter(ratio: Fraction, src_rate: int, out_rate: int) -> str:
@@ -216,6 +289,168 @@ def sidecars_for(video: Path) -> list[Path]:
 
 
 # ---------------------------------------------------------------- restore
+#
+# Timing and bitstream are two separate jobs, done by two separate tools:
+#   * every timestamp (video, subtitles, chapters) is multiplied by 25025/24000 by mkvmerge's
+#     linear --sync stretch, which behaves identically for every input container;
+#   * the frame rate written inside H.264 SPS and MPEG-2 sequence headers is rewritten by
+#     FFmpeg's *_metadata bitstream filters, without decoding, into an intermediate Matroska
+#     file that keeps the source timestamps (-copyts).
+# mkvmerge's own --default-duration is not used to retime: it rewrites the timestamps of
+# Matroska/MP4 input but not of MPEG-TS input, so combined with the stretch it either
+# double-stretches or does nothing depending on the container.
+#
+# Audio is added in a second mux pass, at an offset measured from where the first video frame
+# actually landed in the first pass, so the original A/V offset (scaled) holds whatever start
+# time mkvmerge or FFmpeg chose for the video. Audio before the first video frame is trimmed.
+
+# H.264 VUI timing counts fields: frame rate = time_scale / (2 * num_units_in_tick).
+BITSTREAM_FILTERS = {
+    "h264": lambda t: f"h264_metadata=tick_rate={2 * t.numerator}/{t.denominator}",
+    "mpeg2video": lambda t: f"mpeg2_metadata=frame_rate={t.numerator}/{t.denominator}",
+}
+
+
+def run_mkvmerge(cmd: list[str]) -> None:
+    p = subprocess.run(cmd, env=ENV, capture_output=True, text=True)
+    if p.returncode == 1:                                    # warnings only
+        for line in p.stdout.splitlines():
+            print(f"  mkvmerge: {line}")
+    elif p.returncode != 0:
+        raise RuntimeError(f"mkvmerge failed ({p.returncode}): {p.stdout.strip()}")
+
+
+def rewrite_video_bitstream(src: Path, k: int, codec: str, target: Fraction, tmp: Path) -> Path | None:
+    """Copy video stream k with its bitstream frame-rate fields set to `target`, or None if the
+    codec has no such rewrite. Packets and timestamps are copied unchanged."""
+    bsf = BITSTREAM_FILTERS.get(codec)
+    if bsf is None:
+        return None
+    out = tmp / f"v{k}.mkv"
+    run(["ffmpeg", "-v", "error", "-nostdin", "-copyts", "-i", str(src), "-map", f"0:v:{k}",
+         "-c", "copy", "-bsf:v", bsf(target), "-map_metadata", "-1", "-f", "matroska", str(out)])
+    return out
+
+
+def video_track_options(props: dict) -> list[str]:
+    """mkvmerge options carrying a source video track's properties onto track 0 of another file."""
+    opts = []
+    if props.get("language"):
+        opts += ["--language", f"0:{props['language']}"]
+    if props.get("track_name"):
+        opts += ["--track-name", f"0:{props['track_name']}"]
+    if "default_track" in props:
+        opts += ["--default-track-flag", f"0:{'yes' if props['default_track'] else 'no'}"]
+    if props.get("forced_track"):
+        opts += ["--forced-display-flag", "0:yes"]
+    if props.get("display_dimensions"):
+        opts += ["--display-dimensions", f"0:{props['display_dimensions']}"]
+    return opts
+
+
+# libopus only accepts the Vorbis channel layouts, whose surrounds are labelled "back". The
+# side-surround variants are the same speakers under another label: relabel, never remix.
+OPUS_LAYOUTS = {"5.1(side)": "5.1", "5.0(side)": "5.0"}
+
+
+def encode_audio(src: Path, k: int, a: dict, ratio: Fraction, lead: float, video_at: float,
+                 tmp: Path, audio_codec: str, opus_kbps_per_ch: int) -> tuple[Path, int]:
+    """Slow audio stream k by `ratio` and encode it. `lead` is how far its first sample comes
+    after the first video frame, already scaled; `video_at` is where that frame sits in the
+    output. Audio before the first video frame (negative lead) is trimmed off here,
+    sample-accurately, as docs/pipeline.md section 5 step 2 requires.
+    Returns the file and the mkvmerge delay in milliseconds."""
+    sr = int(a["sample_rate"])
+    out_rate = 48000 if audio_codec == "opus" else sr
+    chain = "asetpts=PTS-STARTPTS," + audio_filter(ratio, sr, out_rate)
+    if lead < 0:
+        chain += f",atrim=start={-lead:.6f},asetpts=PTS-STARTPTS"
+        lead = 0.0
+    delay_ms = round((video_at + lead) * 1000)
+    af = tmp / f"a{k}.mka"
+    cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(src), "-map", f"0:a:{k}",
+           "-af", chain, "-map_metadata", "-1"]
+    if audio_codec == "flac":
+        fmt = a.get("sample_fmt", "")
+        bits = int(a.get("bits_per_raw_sample") or 0)
+        if fmt.startswith("s16") or (0 < bits <= 16):
+            cmd += ["-sample_fmt", "s16"]
+        else:
+            cmd += ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
+        cmd += ["-c:a", "flac", "-compression_level", "8"]
+    else:
+        ch = int(a.get("channels", 2))
+        layout = OPUS_LAYOUTS.get(a.get("channel_layout", ""))
+        if layout:
+            cmd[cmd.index("-af") + 1] += f",channelmap=channel_layout={layout}"
+        cmd += ["-c:a", "libopus", "-b:a", f"{opus_kbps_per_ch * ch}k"]
+    run(cmd + [str(af)])
+    return af, delay_ms
+
+
+def build(src: Path, probe: dict, tmp: Path, target: Fraction, audio_codec: str,
+          opus_kbps_per_ch: int) -> Path:
+    """Write the restored file into `tmp` and return its path (unverified)."""
+    ratio = SOURCE_FPS / target
+    r = f"{ratio.numerator}/{ratio.denominator}"
+    vids = video_streams(probe)
+    tracks = mkv_identify(src)["tracks"]
+    vtids = [t["id"] for t in tracks if t["type"] == "video"]
+    stids = [t["id"] for t in tracks if t["type"] == "subtitles"]
+    props = {t["id"]: t.get("properties", {}) for t in tracks}
+    # ffprobe's video streams and mkvmerge's video tracks are both in file order: the k-th of
+    # one is the k-th of the other.
+    if len(vtids) != len(vids):
+        raise RuntimeError(f"ffprobe sees {len(vids)} video streams, mkvmerge {len(vtids)}")
+
+    # ---- pass 1: video (stretched, bitstream rewritten), subtitles, chapters, attachments, tags
+    rewritten = {}                                           # mkvmerge tid -> intermediate file
+    for k, (tid, v) in enumerate(zip(vtids, vids)):
+        path = rewrite_video_bitstream(src, k, v.get("codec_name", ""), target, tmp)
+        if path is not None:
+            rewritten[tid] = path
+    kept = [tid for tid in vtids if tid not in rewritten]
+    vmkv = tmp / "video.mkv"
+    cmd = ["mkvmerge", "-q", "-o", str(vmkv)]
+    if probe.get("chapters"):
+        cmd += ["--chapter-sync", f"0,{r}"]
+    cmd += ["--video-tracks", ",".join(map(str, kept))] if kept else ["--no-video"]
+    cmd += ["--no-audio"]
+    for tid in kept + stids:
+        cmd += ["--sync", f"{tid}:0,{r}"]
+    cmd += [str(src)]
+    fileno = {}
+    for i, (tid, path) in enumerate(rewritten.items(), start=1):
+        cmd += video_track_options(props[tid]) + ["--sync", f"0:0,{r}", str(path)]
+        fileno[tid] = i
+    order = [f"{fileno[tid]}:0" if tid in fileno else f"0:{tid}" for tid in vtids]
+    order += [f"0:{tid}" for tid in stids]
+    run_mkvmerge(cmd[:1] + ["--track-order", ",".join(order)] + cmd[1:])
+
+    # ---- pass 2: add the audio, each track placed relative to where the video landed
+    v_start = packet_span(src, "v:0")[0]
+    w_start = packet_span(vmkv, "v:0")[0]
+    vtracks = mkv_identify(vmkv)["tracks"]
+    out = tmp / "out.mkv"
+    cmd = ["mkvmerge", "-q", "-o", str(out), str(vmkv)]
+    order = [f"0:{t['id']}" for t in vtracks if t["type"] == "video"]
+    for k, a in enumerate(audio_streams(probe)):
+        lead = (first_decoded_pts(src, f"a:{k}") - v_start) * float(ratio)
+        af, delay_ms = encode_audio(src, k, a, ratio, lead, w_start, tmp, audio_codec, opus_kbps_per_ch)
+        tags = a.get("tags", {})
+        if delay_ms:
+            cmd += ["--sync", f"0:{delay_ms}"]
+        if tags.get("language"):
+            cmd += ["--language", f"0:{tags['language']}"]
+        if tags.get("title"):
+            cmd += ["--track-name", f"0:{tags['title']}"]
+        default = bool(a.get("disposition", {}).get("default"))
+        cmd += ["--default-track-flag", f"0:{'yes' if default else 'no'}", str(af)]
+        order.append(f"{k + 1}:0")
+    order += [f"0:{t['id']}" for t in vtracks if t["type"] == "subtitles"]
+    run_mkvmerge(cmd[:1] + ["--track-order", ",".join(order)] + cmd[1:])
+    return out
+
 
 def restore_one(src: Path, out_dir: Path, target: Fraction, audio_codec: str,
                 opus_kbps_per_ch: int, dry_run: bool) -> str:
@@ -233,113 +468,20 @@ def restore_one(src: Path, out_dir: Path, target: Fraction, audio_codec: str,
     if dry_run:
         return f"would write {dst}"
 
-    ident = mkv_identify(src)
-    mkv_tracks = ident["tracks"]
-    vtids = [t["id"] for t in mkv_tracks if t["type"] == "video"]
-    stids = [t["id"] for t in mkv_tracks if t["type"] == "subtitles"]
+    created = not out_dir.exists()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="pal-restore-", dir=out_dir) as tmpd:
-        tmp = Path(tmpd)
-        # ---- audio
-        # Each track is written starting at 0 and placed with an explicit delay relative to
-        # the video start, scaled by the ratio, so existing A/V offsets survive the retime.
-        v_start = float(vids[0].get("start_time") or 0.0)
-        afiles = []
-        for k, a in enumerate(audio_streams(probe)):
-            sr = int(a["sample_rate"])
-            out_rate = 48000 if audio_codec == "opus" else sr
-            a_start = first_decoded_pts(src, f"a:{k}")
-            delay = (a_start - v_start) * float(ratio)
-            chain = "asetpts=PTS-STARTPTS," + audio_filter(ratio, sr, out_rate)
-            if delay < 0:
-                # Audio starts before the video: trim it here, sample-accurately. (A negative
-                # mkvmerge --sync can only drop whole codec blocks.)
-                chain += f",atrim=start={-delay:.6f},asetpts=PTS-STARTPTS"
-                delay_ms = 0
-            else:
-                delay_ms = round(delay * 1000)
-            af = tmp / f"a{k}.mka"
-            cmd = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(src), "-map", f"0:a:{k}",
-                   "-af", chain, "-map_metadata", "-1"]
-            if audio_codec == "flac":
-                fmt = a.get("sample_fmt", "")
-                bits = int(a.get("bits_per_raw_sample") or 0)
-                if fmt.startswith("s16") or (0 < bits <= 16):
-                    cmd += ["-sample_fmt", "s16"]
-                else:
-                    cmd += ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
-                cmd += ["-c:a", "flac", "-compression_level", "8"]
-            else:
-                ch = int(a.get("channels", 2))
-                cmd += ["-c:a", "libopus", "-b:a", f"{opus_kbps_per_ch * ch}k"]
-            cmd += [str(af)]
-            run(cmd)
-            tags = a.get("tags", {})
-            afiles.append((af, tags.get("language"), tags.get("title"),
-                           bool(a.get("disposition", {}).get("default")), delay_ms))
-
-        # ---- video (optionally fix the MPEG-2 sequence-header frame rate)
-        video_src, video_tid_map = src, {tid: tid for tid in vtids}
-        mpeg2 = vids[0].get("codec_name") == "mpeg2video"
-        extra_inputs = []
-        if mpeg2 and len(vtids) == 1:
-            es = tmp / "v.m2v"
-            run(["ffmpeg", "-v", "error", "-nostdin", "-i", str(src), "-map", "0:v:0", "-c", "copy",
-                 "-bsf:v", f"mpeg2_metadata=frame_rate={target.numerator}/{target.denominator}",
-                 "-f", "mpeg2video", str(es)])
-            extra_inputs.append(es)
-
-        # ---- mux
-        r = f"{ratio.numerator}/{ratio.denominator}"
-        fps_s = f"{target.numerator}/{target.denominator}p"
-        cmd = ["mkvmerge", "-q", "-o", str(tmp / "out.mkv"), "--chapter-sync", f"0,{r}"]
-        order = []
-        if extra_inputs:                                     # MPEG-2: video from rewritten ES
-            cmd += ["--no-video"]
-        else:
-            for tid in vtids:
-                cmd += ["--default-duration", f"{tid}:{fps_s}"]
-                codec = next(t for t in mkv_tracks if t["id"] == tid)["codec"]
-                if "AVC" in codec or "H.264" in codec:
-                    cmd += ["--fix-bitstream-timing-information", f"{tid}:1"]
-                order.append(f"0:{tid}")
-        cmd += ["--no-audio"]
-        for tid in stids:
-            cmd += ["--sync", f"{tid}:0,{r}"]
-        cmd += [str(src)]
-        fileno = 1
-        for es in extra_inputs:
-            # carry the original track's language/name over to the rewritten stream
-            vt = next(t for t in mkv_tracks if t["id"] == vtids[0])["properties"]
-            if vt.get("language"):
-                cmd += ["--language", f"0:{vt['language']}"]
-            if vt.get("track_name"):
-                cmd += ["--track-name", f"0:{vt['track_name']}"]
-            cmd += ["--default-duration", f"0:{fps_s}", str(es)]
-            order.insert(0, f"{fileno}:0")
-            fileno += 1
-        for af, lang, title, default, delay_ms in afiles:
-            if delay_ms:
-                cmd += ["--sync", f"0:{delay_ms}"]
-            if lang:
-                cmd += ["--language", f"0:{lang}"]
-            if title:
-                cmd += ["--track-name", f"0:{title}"]
-            cmd += ["--default-track-flag", f"0:{'yes' if default else 'no'}", str(af)]
-            order.append(f"{fileno}:0")
-            fileno += 1
-        order += [f"0:{tid}" for tid in stids]
-        cmd[1:1] = ["--track-order", ",".join(order)]
-        rc = subprocess.run(cmd, env=ENV).returncode
-        if rc not in (0, 1):                                 # 1 = warnings only
-            raise RuntimeError(f"mkvmerge failed with exit code {rc}")
-
-        # ---- verify before publishing
-        problems = verify(src, tmp / "out.mkv", target, quiet=False)
-        if problems:
-            raise RuntimeError("verification failed: " + "; ".join(problems))
-        os.replace(tmp / "out.mkv", dst)
+    try:
+        with tempfile.TemporaryDirectory(prefix="pal-restore-", dir=out_dir) as tmpd:
+            out = build(src, probe, Path(tmpd), target, audio_codec, opus_kbps_per_ch)
+            problems = verify(src, out, target, quiet=False)
+            if problems:
+                raise RuntimeError("verification failed: " + "; ".join(problems))
+            os.replace(out, dst)
+    except BaseException:
+        # a failed file leaves nothing behind, not even the directory made for it
+        if created and not any(out_dir.iterdir()):
+            out_dir.rmdir()
+        raise
 
     for sc in sidecars_for(src):
         out_sc = out_dir / sc.name
@@ -363,28 +505,50 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
             print("  " + msg)
 
     po, pr = ffprobe(orig), ffprobe(restored)
-    vo, vr = video_streams(po)[0], video_streams(pr)[0]
-    fr = stream_fps(vr)
-    if fr is None or abs(float(fr) - float(target)) > 0.001:
-        problems.append(f"restored video reports {fr} fps, expected {target}")
-    say(f"video fps: {stream_fps(vo)} -> {fr}")
+    vos, vrs = video_streams(po), video_streams(pr)
+    if len(vos) != len(vrs):
+        problems.append(f"video track count changed: {len(vos)} -> {len(vrs)}")
+    v0 = w0 = 0.0
+    for k, (vo, vr) in enumerate(zip(vos, vrs)):
+        tag = "video" if len(vos) == 1 else f"video {k}"
+        fr = stream_fps(vr)
+        if fr is None or abs(float(fr) - float(target)) > 0.001:
+            problems.append(f"{tag}: restored video reports {fr} fps, expected {target}")
+        say(f"{tag} fps: {stream_fps(vo)} -> {fr}")
+        dar_o, dar_r = display_aspect(vo), display_aspect(vr)
+        if dar_o != dar_r:
+            problems.append(f"{tag}: display aspect ratio changed: {dar_o} -> {dar_r}")
 
-    v0, v1, vn = packet_span(orig, "v:0")
-    w0, w1, wn = packet_span(restored, "v:0")
-    if vn != wn:
-        problems.append(f"video frame count changed: {vn} -> {wn}")
-    say(f"video frames: {vn} -> {wn}")
-    vdur_o, vdur_r = vn / 25.0, wn / float(target)
-    if abs(vdur_r - vdur_o * rf) > 0.05:
-        problems.append(f"video duration {vdur_r:.3f}s, expected {vdur_o * rf:.3f}s")
-    say(f"video duration: {vdur_o:.3f}s -> {vdur_r:.3f}s (x{vdur_r / vdur_o:.6f}, expected x{rf:.6f})")
+        rates = bitstream_rates(restored, k, vr.get("codec_name", ""))
+        if rates is not None:
+            wrong = sorted({str(x) for x in rates if x != target})
+            if wrong:
+                problems.append(f"{tag}: bitstream headers declare {', '.join(wrong)} fps, expected {target}")
+            if not rates and bitstream_rates(orig, k, vo.get("codec_name", "")):
+                problems.append(f"{tag}: bitstream frame-rate fields were lost")
+            say(f"{tag} bitstream: {len(rates)} header(s) declaring a frame rate, "
+                f"{'all ' + str(target) if rates and not wrong else 'see above' if wrong else 'none'}")
+
+        # Duration from the timestamps themselves: first to last frame, plus one frame period.
+        o_first, o_last, _, vn = packet_span(orig, f"v:{k}")
+        r_first, r_last, _, wn = packet_span(restored, f"v:{k}")
+        if k == 0:
+            v0, w0 = o_first, r_first                         # audio offsets are measured from here
+        if vn != wn:
+            problems.append(f"{tag}: frame count changed: {vn} -> {wn}")
+        say(f"{tag} frames: {vn} -> {wn}")
+        vdur_o = o_last - o_first + 1 / float(SOURCE_FPS)
+        vdur_r = r_last - r_first + 1 / float(target)
+        if abs(vdur_r - vdur_o * rf) > 0.05:
+            problems.append(f"{tag}: duration {vdur_r:.3f}s, expected {vdur_o * rf:.3f}s")
+        say(f"{tag} duration: {vdur_o:.3f}s -> {vdur_r:.3f}s (x{vdur_r / vdur_o:.6f}, expected x{rf:.6f})")
 
     ao, ar = audio_streams(po), audio_streams(pr)
     if len(ao) != len(ar):
         problems.append(f"audio track count changed: {len(ao)} -> {len(ar)}")
     for k in range(min(len(ao), len(ar))):
-        a0, a1, _ = packet_span(orig, f"a:{k}")
-        b0, b1, _ = packet_span(restored, f"a:{k}")
+        a0, _, a1, _ = packet_span(orig, f"a:{k}")
+        b0, _, b1, _ = packet_span(restored, f"a:{k}")
         span_o = a1 - a0
         # Sync: the audio end, relative to the video start, must scale exactly by the ratio.
         # (Audio that started before the video is trimmed, so only the end is comparable.)
@@ -412,14 +576,32 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
     sr = [s for s in pr["streams"] if s["codec_type"] == "subtitle"]
     if len(so) != len(sr):
         problems.append(f"subtitle track count changed: {len(so)} -> {len(sr)}")
+    # Subtitle times are compared relative to the first video frame, which is what they sync to.
     for k in range(min(len(so), len(sr))):
-        s0, s1, n0 = packet_span(orig, f"s:{k}")
-        t0, t1, n1 = packet_span(restored, f"s:{k}")
-        if n0 != n1:
-            problems.append(f"subtitle {k}: event count {n0} -> {n1}")
-        if n0 and (abs(t0 - s0 * rf) > 0.01 or abs(t1 - s1 * rf) > 0.01):
-            problems.append(f"subtitle {k}: first/last {t0:.3f}/{t1:.3f}s, expected {s0 * rf:.3f}/{s1 * rf:.3f}s")
-        say(f"subtitle {k}: {n0} events, first {s0:.3f}s -> {t0:.3f}s")
+        co_, cr_ = text_cues(orig, k), text_cues(restored, k)
+        if co_ is not None and cr_ is not None:
+            # text: every decoded cue's start and end (empty "clear" samples are not cues)
+            if len(co_) != len(cr_):
+                problems.append(f"subtitle {k}: cue count {len(co_)} -> {len(cr_)}")
+            off = [max(abs((b0 - w0) - (a0 - v0) * rf), abs((b1 - w0) - (a1 - v0) * rf))
+                   for (a0, a1), (b0, b1) in zip(co_, cr_)]
+            if off and max(off) > 0.01:
+                i = off.index(max(off))
+                problems.append(f"subtitle {k}: cue {i + 1} at {cr_[i][0]:.3f}s, expected "
+                                f"{w0 + (co_[i][0] - v0) * rf:.3f}s")
+            first = f"first {co_[0][0]:.3f}s -> {cr_[0][0]:.3f}s" if co_ and cr_ else "empty"
+            say(f"subtitle {k}: {len(co_)} cues, {first}, largest timing error "
+                f"{max(off, default=0) * 1000:.1f} ms")
+        else:
+            # image (PGS, VobSub, DVB): packets, first and last
+            s0, _, s1, n0 = packet_span(orig, f"s:{k}")
+            t0, _, t1, n1 = packet_span(restored, f"s:{k}")
+            if n0 != n1:
+                problems.append(f"subtitle {k}: event count {n0} -> {n1}")
+            e0, e1 = w0 + (s0 - v0) * rf, w0 + (s1 - v0) * rf
+            if n0 and (abs(t0 - e0) > 0.01 or abs(t1 - e1) > 0.01):
+                problems.append(f"subtitle {k}: first/last {t0:.3f}/{t1:.3f}s, expected {e0:.3f}/{e1:.3f}s")
+            say(f"subtitle {k}: {n0} events, first {s0:.3f}s -> {t0:.3f}s")
 
     co, cr = po.get("chapters", []), pr.get("chapters", [])
     if len(co) != len(cr):
@@ -448,13 +630,19 @@ def doctor() -> int:
                               env=ENV, capture_output=True, text=True)
         print(f"soxr      {'ok' if test.returncode == 0 else 'MISSING: ' + test.stderr.strip()}")
         ok &= test.returncode == 0
-        bsfs = capture(["ffmpeg", "-v", "error", "-bsfs"])
-        print(f"mpeg2_metadata bsf {'ok' if 'mpeg2_metadata' in bsfs else 'MISSING'}")
-        ok &= "mpeg2_metadata" in bsfs
+        bsfs = set(capture(["ffmpeg", "-v", "error", "-bsfs"]).split())
+        for bsf in ("h264_metadata", "mpeg2_metadata", "filter_units", "trace_headers"):
+            print(f"ffmpeg bsf {bsf:27} {'ok' if bsf in bsfs else 'MISSING'}")
+            ok &= bsf in bsfs
+        encs = capture(["ffmpeg", "-v", "error", "-encoders"])
+        for enc, needed in (("flac", True), ("libopus", False)):
+            have = re.search(rf"^\s*A\S*\s+{enc}\s", encs, re.M) is not None
+            print(f"ffmpeg encoder {enc:23} {'ok' if have else 'MISSING' if needed else 'missing (only for --audio-codec opus)'}")
+            ok &= have or not needed
     if shutil.which("mkvmerge"):
         h = capture(["mkvmerge", "--help"])
-        for opt in ("--chapter-sync", "--default-duration", "--fix-bitstream-timing-information"):
-            print(f"mkvmerge {opt:36} {'ok' if opt in h else 'MISSING'}")
+        for opt in ("--sync", "--chapter-sync", "--track-order", "--display-dimensions"):
+            print(f"mkvmerge {opt:29} {'ok' if opt in h else 'MISSING'}")
             ok &= opt in h
     print("OK" if ok else "PROBLEMS FOUND")
     return 0 if ok else 1

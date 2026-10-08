@@ -91,7 +91,7 @@ The script starts with `#!/usr/bin/env -S uv run --script` and declares its depe
 "$HOME/ai/pal-restore/pal_restore.py" doctor
 ```
 
-`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`, that FFmpeg's `aresample` supports the `soxr` resampler, that the `mpeg2_metadata` bitstream filter exists, and that `mkvmerge` supports `--chapter-sync`, `--default-duration` and `--fix-bitstream-timing-information`. Resolve every reported problem before continuing.
+`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`; that FFmpeg's `aresample` supports the `soxr` resampler; that the `h264_metadata`, `mpeg2_metadata`, `filter_units` and `trace_headers` bitstream filters exist (the first two rewrite the bitstream frame rate, the last two let verification read it back); that the `flac` encoder exists (and reports whether `libopus` does, which only `--audio-codec opus` needs); and that `mkvmerge` supports `--sync`, `--chapter-sync`, `--track-order` and `--display-dimensions`. Resolve every reported problem before continuing.
 
 ---
 
@@ -106,9 +106,13 @@ For each input:
    ```
    Resampling to 50050 Hz and relabelling as 48000 Hz slows the audio by exactly 50050/48000 = 25025/24000 and lowers the pitch by the same ratio. The two integer rates are required because `asetrate` only accepts integers; the ratio is exact for every source sample rate (48 kHz, 44.1 kHz, 32 kHz and so on). The final resample returns to the track's original sample rate.
    The existing offset between audio and video is preserved and scaled. Audio that started before the first video frame is trimmed sample-accurately in FFmpeg, because a negative `mkvmerge --sync` can only drop whole codec blocks.
-   Language, track title and default flag are carried over.
-3. **Video.** `mkvmerge --default-duration <tid>:24000/1001p` relabels the frame timing. For H.264, `--fix-bitstream-timing-information` also rewrites the SPS timing. For MPEG-2 (DVD sources), the stream is first passed through FFmpeg's `mpeg2_metadata` bitstream filter to set the sequence-header frame rate to 24000/1001, without decoding.
-4. **Subtitles and chapters.** `mkvmerge --sync <tid>:0,25025/24000` scales every embedded subtitle track; `--chapter-sync 0,25025/24000` scales the chapters. Attachments (fonts) and global tags are copied.
+   Language, track title and default flag are carried over. With `--audio-codec opus`, a 5.1(side) or 5.0(side) layout is relabelled 5.1 / 5.0 (same speakers, the label libopus accepts; no remixing).
+3. **Video.** Two separate operations:
+   - *Bitstream frame rate.* H.264 and MPEG-2 tracks are copied (no decoding) through FFmpeg's `h264_metadata=tick_rate=48000/1001` or `mpeg2_metadata=frame_rate=24000/1001` bitstream filter into an intermediate Matroska file that keeps the source timestamps (`-copyts`). This rewrites every SPS / sequence header, including those repeated in-band in transport streams. Other codecs are taken from the source as they are.
+   - *Timestamps.* `mkvmerge --sync <tid>:0,25025/24000` multiplies every video timestamp by the ratio, exactly as for subtitles; mkvmerge then also records the 1001/24000 s default frame duration.
+   `mkvmerge --default-duration` is deliberately not used to retime: it rewrites the timestamps of Matroska/MP4 input but not of MPEG-TS input (which would leave TS video at 25 fps under 23.976 fps audio), and combined with `--sync` it stretches Matroska input twice. See `docs/decisions.md`.
+4. **Subtitles and chapters.** `mkvmerge --sync <tid>:0,25025/24000` scales every embedded subtitle track; `--chapter-sync 0,25025/24000` scales the chapters (passed only when the input has chapters). Attachments (fonts) and global tags are copied.
+   Steps 3 and 4 are one mkvmerge pass. The audio from step 2 is added in a second pass, each track placed relative to where the first video frame actually landed in the first pass.
 5. **Verify** (section 6). Only on success is the output moved from its temporary directory into place.
 6. **Sidecars.** Files next to the input named `<base>.srt`, `<base>.<anything>.srt` (and `.ass`, `.ssa`, `.vtt`) are retimed into the output directory under the same names.
 
@@ -120,13 +124,15 @@ The script refuses to publish an output unless all of these hold:
 
 | Check | Requirement |
 |---|---|
-| Frame rate | Output video reports 24000/1001 |
-| Frame count | Identical to the input |
-| Video duration | Input duration × 25025/24000, within 50 ms |
+| Frame rate | Every output video track reports 24000/1001 |
+| Bitstream frame rate | For H.264 and MPEG-2, every SPS / sequence header in the output (codec private data and in-band) that declares a frame rate declares 24000/1001; if the input declared one, the output still does |
+| Frame count | Identical to the input, per video track |
+| Display aspect ratio | Identical to the input, per video track |
+| Video duration | Measured from the timestamps (first to last frame plus one frame period): input × 25025/24000, within 50 ms |
 | A/V sync | Each audio track's end, measured from the video start, equals the input's × 25025/24000 within 100 ms |
 | Audio start | Input start offset × 25025/24000 (or 0 if it was trimmed), within 50 ms |
 | Pitch | Measured shift between input and output audio is −72.4 cents ± 8 cents (log-spectrum cross-correlation over three excerpts) |
-| Subtitles | Same event count per track; first and last events scaled within 10 ms |
+| Subtitles | Text tracks: decoded cues compared one by one — same cue count, every cue's start and end, relative to the first video frame, scaled within 10 ms (empty "clear" samples, which mkvmerge drops from MP4 text tracks, are not cues). Image tracks (PGS, VobSub, DVB): same packet count; first and last scaled within 10 ms |
 | Chapters | Same count; each start scaled within 10 ms |
 
 The pitch check confirms the audio was slowed in the right direction by the right amount. It cannot judge whether the original is musically correct; that is what section 8's listening check is for.
