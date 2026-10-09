@@ -44,6 +44,14 @@ mkdir -p "$W/tree/pal-restore-stale"; clip "$W/tree/a.mkv"; clip "$W/tree/pal-re
 ok "out-dir inside input tree, stale temp dir: not collected" \
   "tail -1 '$W/tree1.log' | grep -qx '1 restored, 0 failed' && tail -1 '$W/tree2.log' | grep -qx '0 restored, 1 skipped, 0 failed'"
 
+# --out-dir equal to the input's own directory: refused (the sidecar would be its own output).
+mkdir -p "$W/same"; clip "$W/same/film.mp4"
+printf '1\n00:00:01,000 --> 00:00:02,000\nsame\n' > "$W/same/film.srt"
+cp "$W/same/film.srt" "$W/same.srt.orig"
+"$P" restore --out-dir "$W/same" "$W/same/film.mp4" > "$W/same.log" 2>&1; rc=$?
+ok "out-dir is the input directory: refused, nothing written or changed" \
+  "[ $rc = 1 ] && grep -q \"the input's own directory\" '$W/same.log' && [ ! -e '$W/same/film.mkv' ] && cmp -s '$W/same/film.srt' '$W/same.srt.orig'"
+
 # SIGTERM mid-run: exits, and leaves neither output, output directory nor temporary directory.
 # The signal is sent as soon as the temporary directory exists, i.e. while building.
 mkdir -p "$W/term"; clip "$W/term/long.mkv" 600
@@ -57,5 +65,16 @@ else
   echo "FAIL SIGTERM: the restore finished before the signal could be sent"; fail=1
 fi
 ok "no stray ffmpeg after SIGTERM" "! pgrep -f '$W/term/' > /dev/null"
+
+# SIGHUP (terminal closed, SSH dropped): the same.
+"$P" restore "$W/term/long.mkv" > "$W/hup.log" 2>&1 &
+pid=$!
+for _ in $(seq 300); do compgen -G "$W/term/restored/pal-restore-*" > /dev/null && break; sleep 0.05; done
+if compgen -G "$W/term/restored/pal-restore-*" > /dev/null && kill -HUP "$pid" 2>/dev/null; then
+  wait "$pid"; rc=$?
+  ok "SIGHUP: exit 129, nothing left behind" "[ $rc = 129 ] && [ ! -e '$W/term/restored' ]"
+else
+  echo "FAIL SIGHUP: the restore finished before the signal could be sent"; fail=1
+fi
 
 exit $fail

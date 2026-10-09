@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
 
@@ -174,6 +175,31 @@ def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | Non
     return rates
 
 
+def _clock(t: str) -> float:
+    h, m, sec = t.split(":")
+    return (int(h) * 60 + int(m)) * 60 + float(sec)
+
+
+def chapter_editions(path: Path, probe: dict) -> list[dict]:
+    """Every chapter edition of a file, as {"default": bool, "chapters": [(start, end or None)]}
+    with nested chapters flattened in order. Matroska: every edition, read with mkvextract
+    (ffprobe shows only one). Other containers have one chapter list, read with ffprobe."""
+    if "matroska" not in probe["format"]["format_name"]:
+        chs = [(float(c["start_time"]), float(c["end_time"])) for c in probe.get("chapters", [])]
+        return [{"default": True, "chapters": chs}] if chs else []
+    xml = capture(["mkvextract", str(path), "chapters", "-"]).lstrip("\ufeff").strip()
+    if not xml:
+        return []
+    editions = []
+    for ed in ET.fromstring(xml).iter("EditionEntry"):
+        chs = []
+        for atom in ed.iter("ChapterAtom"):
+            end = atom.findtext("ChapterTimeEnd")
+            chs.append((_clock(atom.findtext("ChapterTimeStart")), _clock(end) if end else None))
+        editions.append({"default": ed.findtext("EditionFlagDefault") == "1", "chapters": chs})
+    return editions
+
+
 def display_aspect(stream: dict) -> Fraction:
     sar = stream.get("sample_aspect_ratio", "1:1")
     sar = Fraction(*map(int, sar.split(":"))) if sar not in ("0:1", "N/A") else Fraction(1)
@@ -220,8 +246,11 @@ def audio_filter(ratio: Fraction, src_rate: int, out_rate: int) -> str:
 # ---------------------------------------------------------------- pitch measurement
 
 def _log_spectrum(path: Path, astream: int, start: float, dur: float) -> np.ndarray | None:
-    # -copyts: -ss is an absolute timestamp, the same frame of reference as packet_span.
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-copyts", "-ss", f"{start:.3f}",
+    # `start` is an absolute timestamp (packet_span's frame of reference). Input -ss is a position
+    # from the file's start time, so that is subtracted; -copyts with -ss selects nothing on a
+    # transport stream whose clock starts far from 0 (a Blu-ray m2ts at 600 s).
+    origin = float(ffprobe(path)["format"].get("start_time") or 0.0)
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{max(start - origin, 0.0):.3f}",
                           "-t", f"{dur:.3f}", *PROBE, "-i", str(path), "-map", f"0:a:{astream}",
                           "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
                          check=True, env=ENV, capture_output=True).stdout
@@ -239,15 +268,22 @@ def _log_spectrum(path: Path, astream: int, start: float, dur: float) -> np.ndar
     return (spec - spec.mean()) / (spec.std() + 1e-12)
 
 
+# An excerpt needs four 8192-sample analysis windows at 16 kHz: 2.048 s.
+MIN_EXCERPT = 2.1
+
+
 def measure_pitch_ratio(orig: Path, restored: Path, astream: int, a_first: float, a_end: float,
-                        to_restored) -> float | None:
-    """Median measured frequency ratio restored/original over three excerpts of the track's own
-    span [a_first, a_end] (original time); `to_restored` maps an original time to the restored one."""
+                        to_restored) -> tuple[float | None, str]:
+    """(median measured frequency ratio restored/original, "") over three excerpts inside the
+    track's own span [a_first, a_end] (original time), or (None, reason). `to_restored` maps an
+    original time to the restored one."""
     found = []
     span = a_end - a_first
-    dur = min(60.0, span * 0.2)
+    if span < MIN_EXCERPT:
+        return None, f"track too short ({span:.2f}s)"
+    dur = min(60.0, max(span * 0.2, MIN_EXCERPT))
     for frac in (0.25, 0.5, 0.75):
-        t = a_first + span * frac
+        t = a_first + (span - dur) * frac
         a = _log_spectrum(orig, astream, t, dur)
         b = _log_spectrum(restored, astream, to_restored(t), to_restored(t + dur) - to_restored(t))
         if a is None or b is None:
@@ -263,7 +299,7 @@ def measure_pitch_ratio(orig: Path, restored: Path, astream: int, a_first: float
         else:
             off = 0
         found.append(2 ** ((lags[i] + off) / 1200))
-    return float(np.median(found)) if found else None
+    return (float(np.median(found)), "") if found else (None, "the excerpts are silent")
 
 
 # ---------------------------------------------------------------- sidecars
@@ -276,12 +312,23 @@ def measure_pitch_ratio(orig: Path, restored: Path, astream: int, a_first: float
 #     read as FFmpeg reads them (a millisecond count) and written as 3 digits.
 #   * ASS/SSA: the Start and End fields of Dialogue/Comment lines in [Events], located by that
 #     section's Format line.
-# Every retimed sidecar is verified by decoding input and output with FFmpeg.
+# Lines end at CR LF, LF or CR only: str.splitlines() also breaks at U+0085 and others, and a
+# Latin-1 decoded UTF-8 file is full of byte 0x85 (it is in many Cyrillic and Polish letters).
+# Every retimed sidecar is verified by decoding input and output with FFmpeg, and ASS/SSA also
+# by reading the event fields named by the Format line (FFmpeg reads Start/End by position, so
+# it decodes nothing from a reordered Format line).
 
 _BOMS = [(b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")]
 _CUE_TS = r"(?:(\d+):)?(\d{1,2}):(\d{2})([,.])(\d{1,3})"
 _TIMING_LINE = re.compile(rf"^(\s*){_CUE_TS}(\s*-->\s*){_CUE_TS}(.*)$")
 _ASS_TS = re.compile(r"^(\s*)(\d+):(\d{2}):(\d{2})\.(\d{1,3})(\s*)$")
+_LINES = re.compile(r"[^\r\n]*(?:\r\n|\n|\r|$)")
+# v4+ (Layer) and v4 (Marked) Events fields, in the order used when a file has no Format line.
+ASS_DEFAULT_FIELDS = ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+
+
+def _split_lines(text: str) -> list[str]:
+    return [m for m in _LINES.findall(text) if m]
 
 
 def _read_text(path: Path) -> tuple[str, bytes, str]:
@@ -319,7 +366,7 @@ def _retime_cue_line(m: re.Match, ratio: Fraction, vtt: bool) -> str:
 
 
 def retime_text(ext: str, text: str, ratio: Fraction) -> str:
-    lines = text.splitlines(keepends=True)
+    lines = _split_lines(text)
     out = []
     if ext in (".srt", ".vtt"):
         for line in lines:
@@ -338,8 +385,8 @@ def retime_text(ext: str, text: str, ratio: Fraction) -> str:
             fields = [f.strip().lower() for f in stripped.split(":", 1)[1].split(",")]
         elif section == "[events]" and re.match(r"^(Dialogue|Comment)\s*:", body):
             kind, rest = body.split(":", 1)
-            names = fields or ["layer", "start", "end"]          # v4+ / v4 default order
-            parts = rest.split(",", max(len(names) - 1, 2))
+            names = fields or ASS_DEFAULT_FIELDS
+            parts = rest.split(",", len(names) - 1)
             for name in ("start", "end"):
                 if name in names and names.index(name) < len(parts):
                     i = names.index(name)
@@ -358,20 +405,68 @@ def retime_sidecar(src: Path, dst: Path, ratio: Fraction) -> None:
     dst.write_bytes(bom + retime_text(src.suffix.lower(), text, ratio).encode(enc))
 
 
+def ass_event_times(text: str) -> list[tuple[float, float] | None]:
+    """(start, end) of every Dialogue/Comment line of an ASS/SSA text, read by the fields its
+    [Events] Format line names; None for a line whose times cannot be read. Written apart from
+    retime_text so that it checks it rather than repeats it."""
+    events = re.search(r"(?ims)^\[events\][^\r\n]*$(.*?)(?=^\[|\Z)", text)
+    if not events:
+        return []
+    body = events.group(1)
+    fmt = re.search(r"(?im)^format\s*:([^\r\n]*)", body)
+    names = [f.strip().lower() for f in fmt.group(1).split(",")] if fmt else ASS_DEFAULT_FIELDS
+    times = []
+    for m in re.finditer(r"(?m)^(?:Dialogue|Comment)\s*:([^\r\n]*)", body):
+        parts = m.group(1).split(",", len(names) - 1)
+        got = []
+        for name in ("start", "end"):
+            i = names.index(name) if name in names else len(parts)
+            tm = re.fullmatch(r"\s*(\d+):(\d{2}):(\d{2})\.(\d{1,3})\s*", parts[i]) if i < len(parts) else None
+            if tm:
+                h, mi, sec, frac = tm.groups()
+                got.append((int(h) * 60 + int(mi)) * 60 + int(sec) + int(frac.ljust(3, "0")) / 1000)
+        times.append(tuple(got) if len(got) == 2 else None)
+    return times
+
+
+def _sidecar_input(path: Path) -> list[str]:
+    """FFmpeg input arguments for a sidecar. FFmpeg refuses text that is not UTF-8; a file with
+    no byte-order mark that is not UTF-8 is a legacy 8-bit encoding, read as Latin-1 (every byte
+    decodes; only timing is compared)."""
+    data = path.read_bytes()
+    if not any(data.startswith(bom) for bom, _ in _BOMS):
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            return ["-sub_charenc", "ISO-8859-1", "-i", str(path)]
+    return ["-i", str(path)]
+
+
+def _compare_cues(name: str, how: str, a: list, b: list, ratio: Fraction) -> str | None:
+    if len(a) != len(b):
+        return f"{name}: {len(a)} cues -> {len(b)} ({how})"
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x is None or y is None:
+            return f"{name}: event {i + 1} has unreadable times ({how})"
+        if abs(y[0] - x[0] * float(ratio)) > 0.01 or abs(y[1] - x[1] * float(ratio)) > 0.01:
+            return (f"{name}: cue {i + 1} at {y[0]:.3f}-{y[1]:.3f}s, expected "
+                    f"{x[0] * float(ratio):.3f}-{x[1] * float(ratio):.3f}s ({how})")
+    return None
+
+
 def verify_sidecar(src: Path, dst: Path, ratio: Fraction) -> str | None:
     """A problem description, or None if every cue FFmpeg reads from `src` appears in `dst`
-    scaled by `ratio` (within 10 ms; ASS stores centiseconds)."""
-    a = decoded_cues(["-i", str(src)])
-    b = decoded_cues(["-i", str(dst)])
+    scaled by `ratio` (within 10 ms; ASS stores centiseconds), and for ASS/SSA also every event
+    read by its Format line."""
+    a = decoded_cues(_sidecar_input(src))
+    b = decoded_cues(_sidecar_input(dst))
     if a is None or b is None:
         return f"{src.name}: FFmpeg cannot read {'the original' if a is None else 'the retimed file'}"
-    if len(a) != len(b):
-        return f"{src.name}: {len(a)} cues -> {len(b)}"
-    for i, ((a0, a1), (b0, b1)) in enumerate(zip(a, b)):
-        if abs(b0 - a0 * float(ratio)) > 0.01 or abs(b1 - a1 * float(ratio)) > 0.01:
-            return (f"{src.name}: cue {i + 1} at {b0:.3f}-{b1:.3f}s, expected "
-                    f"{a0 * float(ratio):.3f}-{a1 * float(ratio):.3f}s")
-    return None
+    problem = _compare_cues(src.name, "decoded by FFmpeg", a, b, ratio)
+    if problem or src.suffix.lower() not in (".ass", ".ssa"):
+        return problem
+    ea, eb = ass_event_times(_read_text(src)[0]), ass_event_times(_read_text(dst)[0])
+    return _compare_cues(src.name, "events read by the Format line", ea, eb, ratio)
 
 
 def sidecars_for(video: Path) -> list[Path]:
@@ -429,10 +524,19 @@ def run_mkvmerge(cmd: list[str]) -> None:
         raise RuntimeError(f"mkvmerge failed ({p.returncode}): {p.stdout.strip()}")
 
 
+# How far before 0 an output may start, and how late a Matroska input may start and still be
+# used as it is: Matroska cannot store negative timestamps, so a source whose B-frames give it
+# negative decode times is shifted later as a whole by up to its reorder delay (x264's deepest,
+# three frames, is 120 ms at 25 fps).
+TIMELINE_SLACK = 0.2
+
+
 def working_file(src: Path, probe: dict, tmp: Path) -> Path:
-    """The file every later step reads: the input itself if it is Matroska, otherwise a
-    Matroska copy of its video, audio, subtitle and attachment streams on one time base."""
-    if "matroska" in probe["format"]["format_name"]:
+    """The file every later step reads: the input itself if it is Matroska starting at 0,
+    otherwise a Matroska copy of its video, audio, subtitle and attachment streams on one time
+    base starting at 0."""
+    start = float(probe["format"].get("start_time") or 0.0)
+    if "matroska" in probe["format"]["format_name"] and start <= TIMELINE_SLACK:
         return src
     work = tmp / "work.mkv"
     # Matroska cannot hold MP4 text subtitles (mov_text) as they are: they become SRT text,
@@ -441,6 +545,11 @@ def working_file(src: Path, probe: dict, tmp: Path) -> Path:
     for k, s in enumerate(subtitle_streams(probe)):
         if s.get("codec_name") == "mov_text":
             convert += [f"-c:s:{k}", "srt"]
+    # Nor Blu-ray / DVD LPCM: it becomes plain PCM of the same depth, sample for sample.
+    for k, a in enumerate(audio_streams(probe)):
+        if a.get("codec_name") in ("pcm_bluray", "pcm_dvd"):
+            deep = int(a.get("bits_per_raw_sample") or 0) > 16 or a.get("sample_fmt", "").startswith("s32")
+            convert += [f"-c:a:{k}", "pcm_s24le" if deep else "pcm_s16le"]
     # Cover art (an attached-picture video stream in MP4) would be copied as a real video
     # track; it becomes a Matroska attachment named cover.<ext>, the Matroska convention.
     covers = []
@@ -465,7 +574,8 @@ def rewrite_video_bitstream(work: Path, k: int, codec: str, target: Fraction, tm
         return None
     out = tmp / f"v{k}.mkv"
     run(["ffmpeg", "-v", "error", "-nostdin", "-copyts", "-i", str(work), "-map", f"0:v:{k}",
-         "-c", "copy", "-bsf:v", bsf(target), "-map_metadata", "-1", "-f", "matroska", str(out)])
+         "-c", "copy", "-bsf:v", bsf(target), "-map_metadata", "-1", "-map_chapters", "-1",
+         "-f", "matroska", str(out)])
     return out
 
 
@@ -497,7 +607,10 @@ def track_options(props: dict, video: bool) -> list[str]:
 
 # libopus only accepts the Vorbis channel layouts, whose surrounds are labelled "back". The
 # side-surround variants are the same speakers under another label: relabel, never remix.
+# Layouts outside the Vorbis set (2.1, 4.0, 6.0, 7.1(wide), ...) have no Opus speaker mapping:
+# they are encoded as discrete channels (mapping family 255), every channel kept, none remixed.
 OPUS_LAYOUTS = {"5.1(side)": "5.1", "5.0(side)": "5.0"}
+OPUS_VORBIS_LAYOUTS = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"}
 
 
 def encode_audio(work: Path, k: int, a: dict, ratio: Fraction, lead: float, video_at: float,
@@ -520,7 +633,7 @@ def encode_audio(work: Path, k: int, a: dict, ratio: Fraction, lead: float, vide
         chain += f",channelmap=channel_layout={OPUS_LAYOUTS[a['channel_layout']]}"
     af = tmp / f"a{k}.mka"
     cmd = ["ffmpeg", "-v", "error", "-nostdin", *PROBE, "-i", str(work), "-map", f"0:a:{k}",
-           "-af", chain, "-map_metadata", "-1"]
+           "-af", chain, "-map_metadata", "-1", "-map_chapters", "-1"]
     if audio_codec == "flac":
         fmt = a.get("sample_fmt", "")
         bits = int(a.get("bits_per_raw_sample") or 0)
@@ -531,7 +644,10 @@ def encode_audio(work: Path, k: int, a: dict, ratio: Fraction, lead: float, vide
         cmd += ["-c:a", "flac", "-compression_level", "8"]
     else:
         ch = int(a.get("channels") or 2)
+        layout = OPUS_LAYOUTS.get(a.get("channel_layout", ""), a.get("channel_layout", ""))
         cmd += ["-c:a", "libopus", "-b:a", f"{opus_kbps_per_ch * ch}k"]
+        if layout and layout not in OPUS_VORBIS_LAYOUTS:
+            cmd += ["-mapping_family", "255"]
     run(cmd + [str(af)])
     return af, delay_ms
 
@@ -573,7 +689,7 @@ def build(src: Path, probe: dict, tmp: Path, target: Fraction, audio_codec: str,
     cmd += [str(work)]
     fileno = {}
     for i, (tid, (path, props)) in enumerate(rewritten.items(), start=1):
-        cmd += track_options(props, video=True) + ["--sync", f"0:0,{r}", str(path)]
+        cmd += track_options(props, video=True) + ["--no-chapters", "--sync", f"0:0,{r}", str(path)]
         fileno[tid] = i
     order = [f"{fileno[tid]}:0" if tid in fileno else f"0:{tid}" for tid in vtids]
     order += [f"0:{tid}" for tid in stids]
@@ -591,7 +707,7 @@ def build(src: Path, probe: dict, tmp: Path, target: Fraction, audio_codec: str,
         af, delay_ms = encode_audio(work, k, a, ratio, lead, w_start, tmp, audio_codec, opus_kbps_per_ch)
         if delay_ms:
             cmd += ["--sync", f"0:{delay_ms}"]
-        cmd += track_options(t.get("properties", {}), video=False) + [str(af)]
+        cmd += track_options(t.get("properties", {}), video=False) + ["--no-chapters", str(af)]
         order.append(f"{k + 1}:0")
     order += [f"0:{t['id']}" for t in vtracks if t["type"] == "subtitles"]
     run_mkvmerge(cmd[:1] + ["--track-order", ",".join(order)] + cmd[1:])
@@ -631,7 +747,14 @@ def restore_one(src: Path, dst: Path, target: Fraction, audio_codec: str,
         what = [] if dst.exists() else [str(dst)]
         return "would write " + ", ".join(what + [str(d) for _, d in pending])
 
-    created = not out_dir.exists()
+    if out_dir.resolve() == src.parent.resolve():
+        raise RuntimeError(f"output directory {out_dir} is the input's own directory: outputs and "
+                           f"sidecars would land on the originals; choose another --out-dir")
+    created = []                                             # directories this run makes, leaf first
+    d = out_dir
+    while not d.exists():
+        created.append(d)
+        d = d.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix=TMP_PREFIX, dir=out_dir) as tmpd:
@@ -651,9 +774,11 @@ def restore_one(src: Path, dst: Path, target: Fraction, audio_codec: str,
             if out is not None:
                 os.replace(out, dst)
     except BaseException:
-        # a failed file leaves nothing behind, not even the directory made for it
-        if created and out_dir.exists() and not any(out_dir.iterdir()):
-            out_dir.rmdir()
+        # a failed file leaves nothing behind, not even the directories made for it
+        for d in created:
+            if not d.exists() or any(d.iterdir()):
+                break
+            d.rmdir()
         raise
     if out is None:
         return f"skipped: {dst} already exists (missing sidecars added)"
@@ -713,16 +838,13 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
             problems.append(f"{tag}: duration {vdur_r:.3f}s, expected {vdur_o * rf:.3f}s")
         say(f"{tag} duration: {vdur_o:.3f}s -> {vdur_r:.3f}s (x{vdur_r / vdur_o:.6f}, expected x{rf:.6f})")
 
-    # Timeline: the output starts no later before its first video frame than the input did
-    # (scaled); audio trimmed off before the video can only bring the start closer. 0.2 s of
-    # slack: Matroska cannot store negative timestamps, so a source whose B-frames give it
-    # negative decode times is shifted later as a whole by up to the reorder delay (x264's
-    # deepest, three frames, is 120 ms at 25 fps). The check exists to catch a timeline
-    # carried over from a capture's arbitrary clock (thousands of seconds).
+    # Timeline: the output starts at 0 (within TIMELINE_SLACK), no further before its first
+    # video frame than the input did (scaled); audio trimmed off before the video can only bring
+    # the start closer. It catches a timeline carried over from a capture's arbitrary clock.
     in_start = float(po["format"].get("start_time") or 0.0)
     out_start = float(pr["format"].get("start_time") or 0.0)
     lead_in = max(0.0, (v0 - in_start) * rf)
-    if not (-0.05 <= w0 - out_start <= lead_in + 0.05) or out_start > lead_in + 0.2:
+    if not (-0.05 <= w0 - out_start <= lead_in + 0.05) or out_start > lead_in + TIMELINE_SLACK:
         problems.append(f"timeline: output starts at {out_start:.3f}s with its first video frame at "
                         f"{w0:.3f}s, expected a start within {lead_in:.3f}s of 0")
 
@@ -743,10 +865,10 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
             problems.append(f"audio {k}: starts at {start_r:+.3f}s, expected {exp_start:+.3f}s")
         say(f"audio {k}: end {end_o:.3f}s -> {end_r:.3f}s (expected {end_o * rf:.3f}s), "
             f"start {start_o:+.3f}s -> {start_r:+.3f}s")
-        pitch = measure_pitch_ratio(orig, restored, k, a0, a1, lambda t: w0 + (t - v0) * rf)
+        pitch, why = measure_pitch_ratio(orig, restored, k, a0, a1, lambda t: w0 + (t - v0) * rf)
         exp_c = 1200 * math.log2(1 / rf)
         if pitch is None:
-            say(f"audio {k}: pitch not measurable (the excerpts are silent)")
+            say(f"audio {k}: pitch not measurable ({why})")
         else:
             cents = 1200 * math.log2(pitch)
             say(f"audio {k}: pitch shift {cents:+.1f} cents (expected {exp_c:+.1f})")
@@ -783,15 +905,27 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
                 problems.append(f"subtitle {k}: first/last {t0:.3f}/{t1:.3f}s, expected {e0:.3f}/{e1:.3f}s")
             say(f"subtitle {k}: {n0} events, first {s0:.3f}s -> {t0:.3f}s")
 
-    co, cr = po.get("chapters", []), pr.get("chapters", [])
-    if len(co) != len(cr):
-        problems.append(f"chapter count changed: {len(co)} -> {len(cr)}")
-    for i, (c, d) in enumerate(zip(co, cr)):
-        exp = w0 + (float(c["start_time"]) - v0) * rf
-        if abs(float(d["start_time"]) - exp) > 0.01:
-            problems.append(f"chapter {i}: {d['start_time']}s, expected {exp:.3f}s")
-    if co:
-        say(f"chapters: {len(co)} retimed")
+    # Chapters: every edition, every chapter's start and end, relative to the first video frame.
+    eo, er = chapter_editions(orig, po), chapter_editions(restored, pr)
+    if len(eo) != len(er):
+        problems.append(f"chapter edition count changed: {len(eo)} -> {len(er)}")
+    for n, (a, b) in enumerate(zip(eo, er)):
+        tag = "chapter" if len(eo) == 1 else f"edition {n} chapter"
+        if "matroska" in po["format"]["format_name"] and a["default"] != b["default"]:
+            problems.append(f"edition {n}: default flag changed: {a['default']} -> {b['default']}")
+        if len(a["chapters"]) != len(b["chapters"]):
+            problems.append(f"edition {n}: chapter count changed: {len(a['chapters'])} -> {len(b['chapters'])}")
+        for i, ((s0, s1), (t0, t1)) in enumerate(zip(a["chapters"], b["chapters"])):
+            for x, y, what in ((s0, t0, "start"), (s1, t1, "end")):
+                if x is None or y is None:
+                    if (x is None) != (y is None):
+                        problems.append(f"{tag} {i}: {what} {'lost' if y is None else 'added'}")
+                    continue
+                exp = w0 + (x - v0) * rf
+                if abs(y - exp) > 0.01:
+                    problems.append(f"{tag} {i}: {what} {y:.3f}s, expected {exp:.3f}s")
+    if eo:
+        say(f"chapters: {sum(len(e['chapters']) for e in eo)} in {len(eo)} edition(s) retimed")
 
     say("PASS" if not problems else "FAIL: " + "; ".join(problems))
     return problems
@@ -801,7 +935,7 @@ def verify(orig: Path, restored: Path, target: Fraction, quiet: bool = False) ->
 
 def doctor() -> int:
     ok = True
-    for tool in ("ffmpeg", "ffprobe", "mkvmerge"):
+    for tool in ("ffmpeg", "ffprobe", "mkvmerge", "mkvextract"):
         path = shutil.which(tool)
         print(f"{tool:9} {path or 'MISSING'}")
         ok &= path is not None
@@ -822,7 +956,7 @@ def doctor() -> int:
             ok &= have or not needed
     if shutil.which("mkvmerge"):
         h = capture(["mkvmerge", "--help"])
-        for opt in ("--sync", "--chapter-sync", "--track-order", "--display-dimensions"):
+        for opt in ("--sync", "--chapter-sync", "--track-order", "--display-dimensions", "--no-chapters"):
             print(f"mkvmerge {opt:29} {'ok' if opt in h else 'MISSING'}")
             ok &= opt in h
     print("OK" if ok else "PROBLEMS FOUND")
@@ -860,7 +994,7 @@ def fps_arg(s: str) -> Fraction:
     return t
 
 
-def _terminate(signum, frame):                               # SIGTERM takes Ctrl-C's cleanup path
+def _terminate(signum, frame):                               # SIGTERM/SIGHUP take Ctrl-C's cleanup path
     raise SystemExit(128 + signum)
 
 
@@ -882,6 +1016,7 @@ def main() -> int:
     v.add_argument("--target-fps", type=fps_arg, default=Fraction(24000, 1001))
     args = ap.parse_args()
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGHUP, _terminate)                 # terminal closed, SSH dropped
 
     if args.cmd == "doctor":
         return doctor()

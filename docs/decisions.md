@@ -86,8 +86,16 @@ the first video frame is still trimmed sample-accurately, as pipeline.md section
 ## Known limits (not defects; recorded so they are not rediscovered)
 
 - **HEVC, VC-1, MPEG-4 Part 2** video: timestamps and container frame rate are restored, but
-  bitstream timing fields (HEVC VPS/VUI) are left as they are. pipeline.md scopes the bitstream
-  rewrite to MPEG-2 and H.264; `hevc_metadata` could extend it if such sources appear.
+  bitstream timing fields (HEVC VPS/VUI) are left as they are: confirmed by the round-2 red team,
+  an HEVC output's VUI still declares `vui_time_scale = 25`, `vui_num_units_in_tick = 1` under a
+  24000/1001 container rate. pipeline.md scopes the bitstream rewrite to MPEG-2 and H.264;
+  extending it to HEVC (`hevc_metadata=tick_rate=24000/1001`, read back by trace_headers) is a
+  change to that scope and is put to the architect, not made here.
+- **Opus for layouts outside the Vorbis set** is discrete-channel (mapping family 255): every
+  channel and its order are kept, but the file carries no speaker labels, so a player may not
+  place them. FLAC (the default) keeps every layout with its labels.
+- **Later parts of a DVD VOB set** start mid-GOP and fail verification loudly; pipeline.md
+  section 11 says to concatenate the set first.
 - **Opus encoder delay** shows as a ~7 ms earlier first packet timestamp (Opus pre-skip, 312
   samples). Decoded audio is placed correctly; it is well inside the 50 ms start tolerance.
 - **Language codes**: mkvmerge writes the legacy Matroska form (`ger` for `deu`) next to the
@@ -184,3 +192,58 @@ Found while fixing these, also corrected:
 - `tests/failure_path.py` passed whatever the code did once `restore_one` took the destination
   file instead of the directory; it was rewritten against the new signature and extended to
   the sidecar failure and the re-run cases.
+
+## 7. Red-team round 2 (2026-10-09, the last round allowed): chapters, sidecar encodings, edges
+
+A second independent red-team agent ran about 60 inputs against commit `abd51f6` (about 40
+minutes). All findings were confirmed by running, except LPCM from DVD (`pcm_dvd`) and DVB
+teletext, which it judged by inspection. Each fixed finding is now a permanent test in the
+same scripts as section 6; run against `abd51f6`'s outputs, `check_adversarial.sh` fails every
+new check.
+
+1. **Extra chapter editions with the old 25 fps times, flagged default** (silent: verification
+   read only ffprobe's one edition). `-map_metadata -1` does not drop chapters, so FFmpeg copied
+   the source chapters into every video and audio intermediate and mkvmerge merged them as
+   further editions; players pick a default edition. **Decision:** `-map_chapters -1` on both
+   intermediates and `--no-chapters` before them in mkvmerge; verification now compares the
+   property itself: every edition (read with `mkvextract`), its default flag, its chapter count,
+   every start and end (`chapter_editions`).
+2. **An ASS line left unretimed** (silent). `str.splitlines()` also splits at U+0085, and a
+   UTF-8 file read as Latin-1 has byte 0x85 in many Cyrillic and Polish letters, so a Name such
+   as `Михаил` before Start cut the line in two. FFmpeg decodes nothing from a reordered Format
+   line, so the sidecar check compared 0 cues with 0. **Decision:** lines end only at CR LF, LF
+   or CR; ASS/SSA are also verified by an independent read of every event's Start and End by the
+   Format line (`ass_event_times`), so a line left unretimed or unreadable fails.
+3. **A legacy 8-bit sidecar failed the whole file**: FFmpeg refuses non-UTF-8 text.
+   **Decision:** a sidecar without a byte-order mark that is not valid UTF-8 is decoded by FFmpeg
+   as Latin-1 for verification (`_sidecar_input`); only times are compared.
+4. **`--out-dir` equal to the input's directory**: each sidecar's output was its own source and
+   was skipped as "already exists", leaving the original timing next to the restored MKV.
+   **Decision:** refused with a message (`restore_one`).
+5. **Blu-ray LPCM (`pcm_bluray`) failed**: Matroska cannot store it. **Decision:** the working
+   file converts `pcm_bluray`/`pcm_dvd` to `pcm_s16le`/`pcm_s24le` of the same depth (lossless).
+   DVB teletext subtitles (by inspection only; FFmpeg cannot make a test file) would still fail
+   the file loudly.
+6. **`--audio-codec opus` rejected 2.1, 3.0(back), 3.1, 4.0, quad(side), 6.0, hexagonal,
+   7.1(wide)**. **Decision:** mapping family 255 (discrete channels) for any layout outside the
+   Vorbis set; see Known limits.
+7. **SSA/ASS without a Format line**: End was not retimed (the three-name default list left End
+   joined to the rest of the line). **Decision:** the full ten-field v4/v4+ default.
+8. **Matroska starting at 10 s was rejected** by the timeline check. **Decision:** such input
+   goes through the working file like every other container, so every output timeline starts at
+   0 (one rule); `TIMELINE_SLACK` (0.2 s) names the reorder allowance used by both places.
+9. **SIGHUP left the temporary directory.** **Decision:** SIGHUP takes the SIGTERM path (exit 129).
+10. **A failure under a new nested `--out-dir` left its empty parents.** **Decision:** every
+    directory level the run created is removed, leaf first, while empty.
+11. **HEVC bitstream frame rate unchanged**: outside the design's scope; recorded in Known limits
+    and put to the architect.
+12. **Pitch not measured on audio shorter than about 10 s** (excerpts of 20 % of the span were
+    under the 2.05 s the analysis needs), reported as "silent". **Decision:** excerpts of at least
+    2.1 s placed inside the span; a track shorter than that is reported as too short.
+13. **A later part of a DVD VOB set fails** (starts mid-GOP). **Decision:** documented in
+    pipeline.md section 11 (concatenate the set first).
+
+Found while fixing these, also corrected: pitch excerpts on a transport stream whose clock starts
+far from 0 (the Blu-ray fixture, 600 s) selected no samples, because input `-ss` with `-copyts`
+selects nothing there; the pitch check silently did not run on such files. Excerpts are now
+sought at their time minus the file's start time, without `-copyts`.

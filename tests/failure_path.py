@@ -3,7 +3,8 @@ sidecars are published as one unit.
 
 Loads pal_restore.py and restores tests fixture h264.mkv (which has four sidecars):
   1. verify() forced to fail, fresh output directory: the directory does not exist afterwards;
-  2. verify() forced to fail, existing directory holding another file: only that file remains;
+  2. verify() forced to fail, nested new output directory (deep-out/a/b): no level remains;
+     and an existing directory holding another file: only that file remains;
   3. sidecar verification forced to fail after the MKV verified: nothing is published;
   4. a real restore, then one sidecar output deleted and the restore re-run: only that sidecar
      is written again, the MKV is not rebuilt (its modification time is unchanged).
@@ -46,6 +47,9 @@ pr.verify = lambda *a, **k: ["forced failure"]
 fresh = scratch / "fresh-out"
 assert not fresh.exists(), f"{fresh} must not exist before the test"
 check(fails(fresh / "h264.mkv") and not fresh.exists(), "fresh dir: nothing left behind")
+
+deep = scratch / "deep-out"
+check(fails(deep / "a" / "b" / "h264.mkv") and not deep.exists(), "nested new out-dir: every level removed")
 
 existing = scratch / "existing-out"
 existing.mkdir()

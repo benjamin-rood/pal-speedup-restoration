@@ -75,6 +75,23 @@ ffmpeg -v error -y -itsoffset 2 -f lavfi -i "$VID" -f lavfi -i "$CHORD" -i "$tmp
 ffmpeg -v error -y -f lavfi -i "$SMALL" -f lavfi -i "$CHORD" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 \
   -b:v 300k -c:a libopus "$out/vp9.webm" &
 
+# bluray.m2ts: Blu-ray shape, interlaced MPEG-2, AC-3 and LPCM (pcm_bluray, which Matroska
+# cannot hold as it is), clock starting at 600 s.
+ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -f lavfi -i "$CHORD" -map 0:v -map 1:a -map 2:a \
+  -c:v mpeg2video -b:v 3M -flags +ilme+ildct -c:a:0 ac3 -c:a:1 pcm_bluray -ac:a:1 2 \
+  -mpegts_m2ts_mode 1 -output_ts_offset 600 -f mpegts "$out/bluray.m2ts" &
+
+# offset10.mkv: Matroska whose every track starts at 10 s.
+ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" "${X264[@]}" -c:a flac -output_ts_offset 10 "$out/offset10.mkv" &
+
+# chapters.mkv: Matroska with chapters (the video and audio intermediates must not add editions).
+( ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -i "$tmp/chap.meta" -map 0:v -map 1:a -map_chapters 2 \
+    "${X264[@]}" -c:a ac3 "$out/chapters.mkv" ) &
+
+# l21.mkv: 2.1 AC-3, a layout outside the Vorbis set (for an --audio-codec opus run).
+ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -filter_complex "[1:a]pan=2.1|FL=c0|FR=c0|LFE=c0[a]" \
+  -map 0:v -map "[a]" "${X264[@]}" -c:a ac3 "$out/l21.mkv" &
+
 # sidecars/: film.mkv and film.part2.mkv (6 s) with adversarial sidecars.
 for name in film film.part2; do
   ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x240:rate=25:duration=6" -f lavfi -i "sine=f=440:d=6" \
@@ -104,4 +121,12 @@ w("film.map.vtt", "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:10.000,MPEGTS:900000\n\n"
   "100:00:00.000 --> 100:00:01.000\nthree-digit hours\n\nNOTE written 00:00:01.000 --> 00:00:02.000\n")
 w("film.upper.SRT", "1\n00:01:00,000 --> 00:01:02,000\nUpper\n")
 w("film.part2.srt", "1\n00:01:00,000 --> 00:01:02,000\nPart two\n")
+# UTF-8 without BOM: "х" is D1 85, and 0x85 must not end a line. Reordered Format line.
+w("film.cyr.ass", "[Script Info]\nScriptType: v4.00+\n\n[Events]\nFormat: Layer, Style, Name, Start, End, "
+  "MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,Default,Михаил,0:01:00.00,0:01:02.00,0,0,0,,Привет\n")
+# Windows-1252 (not UTF-8): FFmpeg needs to be told the encoding to verify it.
+w("film.cp.srt", "1\n00:01:00,000 --> 00:01:02,000\nWait\u2026 Caf\u00e9\n", "cp1252")
+# SSA with no Format line: the default v4 field order applies.
+w("film.nofmt.ssa", "[Script Info]\nScriptType: v4.00\n\n[Events]\n"
+  "Dialogue: Marked=0,0:01:00.00,0:01:02.00,Default,,0000,0000,0000,,no format\n")
 PY

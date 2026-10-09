@@ -32,6 +32,9 @@ check "dvd MPEG-2 sequence header" \
   "$(headers "$R/dvd.mkv" 'frame_rate_code|frame_rate_extension_n|frame_rate_extension_d')" \
   "frame_rate_code=1 frame_rate_extension_d=0 frame_rate_extension_n=0"
 
+# Chapters: one edition, as in the input (the intermediates used to add unscaled ones).
+check "h264 one chapter edition" "$(mkvextract "$R/h264.mkv" chapters - | grep -c '<EditionEntry>')" "1"
+
 # 5.000 s x 25025/24000 = 5.213541.. ; 115.04 s -> 119.953..
 check "srt first cue" "$(sed -n 2p "$R/h264.srt")" "00:00:05,214 --> 00:00:07,820"
 check "srt last cue" "$(sed -n 10p "$R/h264.srt")" "00:01:54,698 --> 00:01:59,953"

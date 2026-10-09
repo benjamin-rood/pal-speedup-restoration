@@ -13,7 +13,7 @@ ok() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1: [$2] is false"; fa
 
 frames() { ffmpeg -v error -i "$1" -map "0:v:$2" -f framemd5 - | grep -v '^#' | cut -d, -f6 | md5sum; }
 for pair in mixed.ts dvb.ts dvbbig.ts vobsub.vob late2.vob dvdrip.mkv lead.mkv hires.mkv xvid.avi \
-            edit.mp4 flags.mkv cover.mp4 vp9.webm; do
+            edit.mp4 flags.mkv cover.mp4 vp9.webm bluray.m2ts offset10.mkv chapters.mkv l21.mkv; do
   base=${pair%.*}
   [ -f "$R/$base.mkv" ] || { echo "FAIL $base: no output"; fail=1; continue; }
   check "$base frames identical" "$(frames "$F/$pair" 0)" "$(frames "$R/$base.mkv" 0)"
@@ -62,6 +62,25 @@ ain=$(alen "$F/xvid.avi"); aout=$(alen "$R/xvid.mkv")
 ok "xvid: audio length scaled, only the $vlead s before the first frame trimmed ($ain -> $aout bytes)" \
   "python3 -c 'import sys; sys.exit(abs($aout / 96000 - ($ain / 96000 - $vlead) * 25025 / 24000) > 0.01)'"
 
+# Chapters: exactly one edition (the video/audio intermediates used to add one each, with the
+# unscaled 25 fps times, flagged default), and its times scaled.
+editions() { mkvextract "$1" chapters - | grep -c '<EditionEntry>'; }
+check "chapters.mkv: one chapter edition" "$(editions "$R/chapters.mkv")" "1"
+check "edit.mp4: one chapter edition" "$(editions "$R/edit.mkv")" "1"
+check "chapters.mkv: second chapter at 20.854 s" \
+  "$(ffprobe -v error -show_entries chapter=start_time -of csv=p=0 "$R/chapters.mkv" | sed -n 2p)" "20.854167"
+# Blu-ray LPCM: kept as PCM of the same depth; pitch actually measured on both tracks (the
+# excerpts used to select nothing on a transport stream whose clock starts at 600 s).
+check "bluray: audio codecs" "$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$R/bluray.mkv" | paste -sd,)" "flac,flac"
+check "bluray: pitch measured on both tracks" "$(sed -n '/bluray.m2ts$/,/restored ->/p' "$F/restore.log" | grep -c 'pitch shift')" "2"
+check "sidecars/film.mkv (6 s): pitch measured" "$(sed -n '/sidecars\/film.mkv$/,/restored ->/p' "$F/restore.log" | grep -c 'pitch shift')" "1"
+# A Matroska input starting at 10 s gives a timeline starting at 0.
+ok "offset10: timeline starts near 0" "python3 -c 'import sys; sys.exit($(start "$R/offset10.mkv") > 0.2)'"
+# Opus with a layout outside the Vorbis set: encoded, every channel kept.
+"$(dirname "$0")/../pal_restore.py" restore --audio-codec opus --out-dir "$F/opus" "$F/l21.mkv" > "$F/opus.log" 2>&1
+check "opus 2.1: restored, 3 channels" "$(tail -1 "$F/opus.log"),$(ffprobe -v error -select_streams a -show_entries stream=channels -of csv=p=0 "$F/opus/l21.mkv" 2>/dev/null)" \
+  "1 restored, 0 failed,3"
+
 # Sidecars: exact text. 60 s -> 62.5625 s (written 62.562, rounded to even), 62 s -> 64.6479 s.
 check "sidecar dot separator kept" "$(sed -n 2p "$S/film.dot.srt")" "00:01:02.562 --> 00:01:04.648"
 check "sidecar short fractions read as ms" "$(sed -n 2p "$S/film.short.srt")" "00:01:02,615 --> 00:01:04,653"
@@ -82,6 +101,13 @@ check "sidecar VTT header untouched" "$(sed -n 2p "$S/film.map.vtt")" "X-TIMESTA
 check "sidecar VTT hourless cue, settings kept" "$(sed -n 4p "$S/film.map.vtt")" "01:02.562 --> 01:04.648 align:start position:10%"
 check "sidecar VTT hours 100" "$(sed -n 10p "$S/film.map.vtt")" "104:16:15.000 --> 104:16:16.043"
 check "sidecar VTT NOTE untouched" "$(sed -n 13p "$S/film.map.vtt")" "NOTE written 00:00:01.000 --> 00:00:02.000"
+check "sidecar Cyrillic name before Start retimed" "$(grep -a '^Dialogue' "$S/film.cyr.ass")" \
+  "Dialogue: 0,Default,Михаил,0:01:02.56,0:01:04.65,0,0,0,,Привет"
+check "sidecar Windows-1252 retimed" "$(sed -n 2p "$S/film.cp.srt")" "00:01:02,562 --> 00:01:04,648"
+check "sidecar Windows-1252 text bytes kept" "$(sed -n 3p "$S/film.cp.srt" | od -An -tx1 | tr -d ' \n')" \
+  "$(sed -n 3p "$F/sidecars/film.cp.srt" | od -An -tx1 | tr -d ' \n')"
+check "sidecar SSA without Format line" "$(grep -a '^Dialogue' "$S/film.nofmt.ssa")" \
+  "Dialogue: Marked=0,0:01:02.56,0:01:04.65,Default,,0000,0000,0000,,no format"
 # Ownership: film.part2.srt belongs to film.part2.mkv (the longest matching base name).
 owners() { sed -n "/^\/.*\/$1\.mkv\$/,/^\/\|^[0-9]/p" "$2" | grep -c 'sidecar retimed: film.part2.srt'; }
 check "sidecar film.part2.srt retimed with film.part2.mkv, not film.mkv" \

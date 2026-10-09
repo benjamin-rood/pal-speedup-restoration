@@ -11,13 +11,13 @@ tests/make_fixtures.sh "$F"              # ~10 s, about 200 MB
 tests/check_outputs.sh "$F"              # independent checks; every line PASS, exit 0
 mkdir -p "$F/fail" && uv run -q --with numpy python tests/failure_path.py "$F" "$F/fail"
 
-# Adversarial set: cases earlier versions got wrong (docs/decisions.md section 6).
+# Adversarial set: cases earlier versions got wrong (docs/decisions.md sections 6 and 7).
 A=/some/other/scratch/dir
 tests/make_adversarial.sh "$A"           # ~5 s
-./pal_restore.py restore "$A" > "$A/restore.log" 2>&1   # expect: 15 restored, 0 failed
-tests/check_adversarial.sh "$A"          # reads $A/restore.log; every line PASS, exit 0
+./pal_restore.py restore "$A" > "$A/restore.log" 2>&1   # expect: 19 restored, 0 failed
+tests/check_adversarial.sh "$A"          # reads $A/restore.log, runs one Opus restore; every line PASS
 
-# Command line: missing inputs, collisions, bad options, symlinks, SIGTERM.
+# Command line: missing inputs, collisions, bad options, symlinks, --out-dir = input dir, SIGTERM, SIGHUP.
 tests/check_cli.sh /some/new/scratch/dir # must not exist; every line PASS, exit 0
 ```
 
@@ -47,12 +47,17 @@ tests/check_cli.sh /some/new/scratch/dir # must not exist; every line PASS, exit
 | `flags.mkv` | `pt-BR` language, track name, commentary and default flags |
 | `cover.mp4` | cover art (must become an attachment, not a video track) |
 | `vp9.webm` | VP9 + Opus |
-| `sidecars/` | `film.mkv`, `film.part2.mkv` and eleven adversarial sidecars: `.` separator, short fractions, UTF-16, hours 1/10/100, timestamp in text, ASS reordered Format, ASS hours 10, SSA `Marked=`, VTT header/NOTE/cue settings, upper-case extension, `film.part2.srt` ownership |
+| `bluray.m2ts` | Blu-ray shape: interlaced MPEG-2, AC-3 and LPCM, clock at 600 s (LPCM conversion, pitch measured on a far-off clock) |
+| `offset10.mkv` | Matroska whose tracks all start at 10 s (timeline must start at 0) |
+| `chapters.mkv` | chapters (exactly one edition, scaled) |
+| `l21.mkv` | 2.1 AC-3, restored with `--audio-codec opus` (layout outside the Vorbis set) |
+| `sidecars/` | `film.mkv`, `film.part2.mkv` and eleven adversarial sidecars: `.` separator, short fractions, UTF-16, hours 1/10/100, timestamp in text, ASS reordered Format, ASS hours 10, SSA `Marked=`, VTT header/NOTE/cue settings, upper-case extension, `film.part2.srt` ownership, Cyrillic name before Start in a reordered Format line, Windows-1252 SRT, SSA without a Format line |
 
 `tests/mkvobsub.py` writes the small VobSub pair the bitmap-subtitle fixtures are made from.
 
 `check_outputs.sh` and `check_adversarial.sh` check what `pal_restore.py` does not check about
 itself: decoded frames bit-identical to the input (no re-encode), bitstream timing fields, exact
 sidecar text, audio band, track properties, and the specific defects each adversarial case was
-made for. Run against the outputs of commit `ff4f58a` (before the round-1 fixes),
-`check_adversarial.sh` reports 23 failures, so its checks can fail.
+made for. Run against the outputs of commit `ff4f58a` (before the round-1 fixes) it reports 23 failures,
+and against `abd51f6` (before the round-2 fixes) every check added in round 2 fails, so its
+checks can fail.
