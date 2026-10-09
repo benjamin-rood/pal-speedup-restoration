@@ -91,7 +91,7 @@ The script starts with `#!/usr/bin/env -S uv run --script` and declares its depe
 "$HOME/ai/pal-restore/pal_restore.py" doctor
 ```
 
-`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`; that FFmpeg's `aresample` supports the `soxr` resampler; that the `h264_metadata`, `mpeg2_metadata`, `filter_units` and `trace_headers` bitstream filters exist (the first two rewrite the bitstream frame rate, the last two let verification read it back); that the `flac` encoder exists (and reports whether `libopus` does, which only `--audio-codec opus` needs); and that `mkvmerge` supports `--sync`, `--chapter-sync`, `--track-order` and `--display-dimensions`. Resolve every reported problem before continuing.
+`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvextract` (verification reads every chapter edition with it); that FFmpeg's `aresample` supports the `soxr` resampler; that the `h264_metadata`, `mpeg2_metadata`, `filter_units` and `trace_headers` bitstream filters exist (the first two rewrite the bitstream frame rate, the last two let verification read it back); that the `flac` encoder exists (and reports whether `libopus` does, which only `--audio-codec opus` needs); and that `mkvmerge` supports `--sync`, `--chapter-sync`, `--no-chapters`, `--track-order` and `--display-dimensions`. Resolve every reported problem before continuing.
 
 ---
 
