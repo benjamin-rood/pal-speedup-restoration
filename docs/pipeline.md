@@ -8,7 +8,7 @@ Because no frames were added, dropped or blended, nothing needs to be inverse-te
 
 | Component | Operation | Re-encoded? |
 |---|---|---|
-| Video | Timestamps relabelled 25 → 24000/1001 fps; MPEG-2 and H.264 bitstream frame-rate fields rewritten to match | **No.** Every frame is bit-identical to the input. |
+| Video | Timestamps relabelled 25 → 24000/1001 fps; MPEG-2, H.264 and HEVC bitstream frame-rate fields rewritten to match | **No.** Every frame is bit-identical to the input. |
 | Audio (every track) | Resampled by exactly 24000/25025, restoring original speed **and** pitch together | Yes, to FLAC (lossless from the decoded audio) by default |
 | Embedded subtitles (text and image) | Timestamps scaled by 25025/24000 | No |
 | Chapters | Times scaled by 25025/24000 | No |
@@ -70,7 +70,7 @@ Disk space: outputs are roughly the size of the input plus the growth from FLAC 
 sudo pacman -S --needed ffmpeg mkvtoolnix-cli uv
 ```
 
-- `ffmpeg` provides decoding, the SoX resampler (`soxr`), and the `mpeg2_metadata` bitstream filter.
+- `ffmpeg` provides decoding, the SoX resampler (`soxr`), and the `h264_metadata`, `hevc_metadata` and `mpeg2_metadata` bitstream filters.
 - `mkvtoolnix-cli` provides `mkvmerge`, which retimes video, subtitles and chapters without re-encoding.
 - `uv` runs the restoration script with its single Python dependency (`numpy`, used for the pitch verification) in an isolated, cached environment. Nothing is installed into the system Python.
 
@@ -91,7 +91,7 @@ The script starts with `#!/usr/bin/env -S uv run --script` and declares its depe
 "$HOME/ai/pal-restore/pal_restore.py" doctor
 ```
 
-`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvextract` (verification reads every chapter edition with it); that FFmpeg's `aresample` supports the `soxr` resampler; that the `h264_metadata`, `mpeg2_metadata`, `filter_units` and `trace_headers` bitstream filters exist (the first two rewrite the bitstream frame rate, the last two let verification read it back); that the `flac` encoder exists (and reports whether `libopus` does, which only `--audio-codec opus` needs); and that `mkvmerge` supports `--sync`, `--chapter-sync`, `--no-chapters`, `--track-order` and `--display-dimensions`. Resolve every reported problem before continuing.
+`doctor` must print `OK`. It checks `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvextract` (verification reads every chapter edition with it); that FFmpeg's `aresample` supports the `soxr` resampler; that the `h264_metadata`, `hevc_metadata`, `mpeg2_metadata`, `filter_units` and `trace_headers` bitstream filters exist (the first three rewrite the bitstream frame rate, the last two let verification read it back); that the `flac` encoder exists (and reports whether `libopus` does, which only `--audio-codec opus` needs); and that `mkvmerge` supports `--sync`, `--chapter-sync`, `--no-chapters`, `--track-order` and `--display-dimensions`. Resolve every reported problem before continuing.
 
 ---
 
@@ -109,7 +109,7 @@ For each input:
    The existing offset between audio and video is preserved and scaled. Audio that started before the first video frame is trimmed sample-accurately in FFmpeg, because a negative `mkvmerge --sync` can only drop whole codec blocks.
    Language (with region, e.g. `pt-BR`), track name, and the default, forced, commentary, hearing-impaired, visual-impaired, original and text-descriptions flags are carried over. With `--audio-codec opus`, a 5.1(side) or 5.0(side) layout is relabelled 5.1 / 5.0 (same speakers, the label libopus accepts; no remixing); any other layout outside the Vorbis set (2.1, 3.1, 4.0, 6.0, 7.1(wide), …) is encoded as discrete channels (Opus mapping family 255), every channel kept, none remixed, without speaker labels.
 3. **Video.** Two separate operations:
-   - *Bitstream frame rate.* H.264 and MPEG-2 tracks are copied (no decoding) through FFmpeg's `h264_metadata=tick_rate=48000/1001` or `mpeg2_metadata=frame_rate=24000/1001` bitstream filter into an intermediate Matroska file that keeps the source timestamps (`-copyts`). This rewrites every SPS / sequence header, including those repeated in-band in transport streams. Other codecs are taken from the source as they are.
+   - *Bitstream frame rate.* H.264, HEVC and MPEG-2 tracks are copied (no decoding) through FFmpeg's `h264_metadata=tick_rate=48000/1001`, `hevc_metadata=tick_rate=24000/1001` or `mpeg2_metadata=frame_rate=24000/1001` bitstream filter into an intermediate Matroska file that keeps the source timestamps (`-copyts`). This rewrites every SPS / sequence header (for HEVC, every VPS and SPS VUI), including those repeated in-band in transport streams, and leaves every other field as it is (HDR colour description and mastering-display metadata included). H.264 counts fields, hence 48000/1001; HEVC counts frames. Other codecs are taken from the source as they are.
    - *Timestamps.* `mkvmerge --sync <tid>:0,25025/24000` multiplies every video timestamp by the ratio, exactly as for subtitles; mkvmerge then also records the 1001/24000 s default frame duration.
    `mkvmerge --default-duration` is deliberately not used to retime: it rewrites the timestamps of Matroska/MP4 input but not of MPEG-TS input (which would leave TS video at 25 fps under 23.976 fps audio), and combined with `--sync` it stretches Matroska input twice. See `docs/decisions.md`.
 4. **Subtitles and chapters.** `mkvmerge --sync <tid>:0,25025/24000` scales every embedded subtitle track; `--chapter-sync 0,25025/24000` scales the chapters (passed only when the input has chapters). The video and audio intermediates are written without chapters and added with `--no-chapters`, so the only chapters in the output are the scaled ones. Attachments (fonts) and global tags are copied.
@@ -240,7 +240,7 @@ Not handled, by design:
 - Sidecar VobSub (`.idx`/`.sub`) and other bitmap sidecars are not retimed and are reported by absence. Embedded image subtitles (PGS, VobSub inside MKV) **are** retimed.
 - Inputs that are not 25 fps are skipped.
 - **DVD VOB sets** (`VTS_01_1.VOB`, `VTS_01_2.VOB`, …) are split at arbitrary sector boundaries, so a later part starts mid-GOP and fails verification (frame count). Concatenate the set first (`cat VTS_01_1.VOB VTS_01_2.VOB … > VTS_01.VOB`) and restore that.
-- **HEVC, VC-1, MPEG-4 Part 2** video: timestamps and container frame rate are restored; the frame rate written inside the bitstream is left as it is (section 5 step 3 rewrites H.264 and MPEG-2 only).
+- **VC-1, MPEG-4 Part 2, VP9, AV1** video: timestamps and container frame rate are restored; the frame rate written inside the bitstream (where the codec has one) is left as it is (section 5 step 3 rewrites H.264, HEVC and MPEG-2).
 
 ---
 

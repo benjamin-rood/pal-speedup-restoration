@@ -137,11 +137,14 @@ def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | Non
     """Frame rate declared by every sequence-level header of one video track, in stream order.
 
     H.264: every SPS (in the codec private data and in-band) whose VUI carries timing info;
-    rate = time_scale / (2 * num_units_in_tick). MPEG-2: every sequence header, with its
+    rate = time_scale / (2 * num_units_in_tick). HEVC: every VPS and SPS VUI carrying timing
+    info; rate = time_scale / num_units_in_tick. MPEG-2: every sequence header, with its
     sequence extension. Returns None for codecs whose headers are not checked.
     """
     if codec == "h264":
         units, start = "7", "seq_parameter_set_id"
+    elif codec == "hevc":
+        units, start = "32|33", "nal_unit_type"
     elif codec == "mpeg2video":
         units, start = "0xb3|0xb5", "frame_rate_code"
     else:
@@ -167,6 +170,10 @@ def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | Non
         if codec == "h264":
             if h.get("timing_info_present_flag") and h.get("num_units_in_tick"):
                 rates.append(Fraction(h["time_scale"], 2 * h["num_units_in_tick"]))
+        elif codec == "hevc":
+            for pre in ("vps_", "vui_"):
+                if h.get(f"{pre}timing_info_present_flag") and h.get(f"{pre}num_units_in_tick"):
+                    rates.append(Fraction(h[f"{pre}time_scale"], h[f"{pre}num_units_in_tick"]))
         else:
             rate = MPEG2_FRAME_RATES.get(h["frame_rate_code"])
             if rate is not None:
@@ -509,8 +516,10 @@ def sidecars_for(video: Path) -> list[Path]:
 # time mkvmerge or FFmpeg chose for the video. Audio before the first video frame is trimmed.
 
 # H.264 VUI timing counts fields: frame rate = time_scale / (2 * num_units_in_tick).
+# HEVC VPS and VUI timing count frames: frame rate = time_scale / num_units_in_tick.
 BITSTREAM_FILTERS = {
     "h264": lambda t: f"h264_metadata=tick_rate={2 * t.numerator}/{t.denominator}",
+    "hevc": lambda t: f"hevc_metadata=tick_rate={t.numerator}/{t.denominator}",
     "mpeg2video": lambda t: f"mpeg2_metadata=frame_rate={t.numerator}/{t.denominator}",
 }
 
@@ -946,7 +955,7 @@ def doctor() -> int:
         print(f"soxr      {'ok' if test.returncode == 0 else 'MISSING: ' + test.stderr.strip()}")
         ok &= test.returncode == 0
         bsfs = set(capture(["ffmpeg", "-v", "error", "-bsfs"]).split())
-        for bsf in ("h264_metadata", "mpeg2_metadata", "filter_units", "trace_headers"):
+        for bsf in ("h264_metadata", "hevc_metadata", "mpeg2_metadata", "filter_units", "trace_headers"):
             print(f"ffmpeg bsf {bsf:27} {'ok' if bsf in bsfs else 'MISSING'}")
             ok &= bsf in bsfs
         encs = capture(["ffmpeg", "-v", "error", "-encoders"])

@@ -24,6 +24,12 @@ ffmpeg -v error -y -f lavfi -i "$SMALL" -f lavfi -i "testsrc=size=320x240:rate=2
   -map 0:v -map 1:v -map 2:a -c:v:0 libx264 -preset ultrafast -c:v:1 libx265 -preset ultrafast \
   -x265-params log-level=error -c:a mp2 -output_ts_offset 50000 -f mpegts "$out/mixed.ts" &
 
+# hdr.mkv: 10-bit HEVC tagged HDR10 (BT.2020, PQ, mastering display and content light level):
+# the VPS/VUI frame rate must be rewritten and every HDR tag kept.
+ffmpeg -v error -y -f lavfi -i "$SMALL" -f lavfi -i "$CHORD" -pix_fmt yuv420p10le -c:v libx265 -preset ultrafast \
+  -x265-params "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:hdr10=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400" \
+  -c:a flac "$out/hdr.mkv" &
+
 # dvb.ts / dvbbig.ts: broadcast capture with DVB bitmap subtitles; the second starts at 50000 s.
 for c in dvb:0 dvbbig:50000; do
   ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -i "$tmp/vs.idx" -map 0:v -map 1:a -map 2:s \

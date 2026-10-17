@@ -14,7 +14,7 @@ mkdir -p "$F/fail" && uv run -q --with numpy python tests/failure_path.py "$F" "
 # Adversarial set: cases earlier versions got wrong (docs/decisions.md sections 6 and 7).
 A=/some/other/scratch/dir
 tests/make_adversarial.sh "$A"           # ~5 s
-./pal_restore.py restore "$A" > "$A/restore.log" 2>&1   # expect: 19 restored, 0 failed
+./pal_restore.py restore "$A" > "$A/restore.log" 2>&1   # expect: 20 restored, 0 failed
 tests/check_adversarial.sh "$A"          # reads $A/restore.log, runs one Opus restore; every line PASS
 
 # Command line: missing inputs, collisions, bad options, symlinks, --out-dir = input dir, SIGTERM, SIGHUP.
@@ -50,6 +50,7 @@ tests/check_cli.sh /some/new/scratch/dir # must not exist; every line PASS, exit
 | `bluray.m2ts` | Blu-ray shape: interlaced MPEG-2, AC-3 and LPCM, clock at 600 s (LPCM conversion, pitch measured on a far-off clock) |
 | `offset10.mkv` | Matroska whose tracks all start at 10 s (timeline must start at 0) |
 | `chapters.mkv` | chapters (exactly one edition, scaled) |
+| `hdr.mkv` | 10-bit HEVC tagged HDR10 (bitstream frame rate rewritten, HDR tags kept) |
 | `l21.mkv` | 2.1 AC-3, restored with `--audio-codec opus` (layout outside the Vorbis set) |
 | `sidecars/` | `film.mkv`, `film.part2.mkv` and eleven adversarial sidecars: `.` separator, short fractions, UTF-16, hours 1/10/100, timestamp in text, ASS reordered Format, ASS hours 10, SSA `Marked=`, VTT header/NOTE/cue settings, upper-case extension, `film.part2.srt` ownership, Cyrillic name before Start in a reordered Format line, Windows-1252 SRT, SSA without a Format line |
 

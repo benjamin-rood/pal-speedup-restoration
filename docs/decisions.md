@@ -85,12 +85,8 @@ the first video frame is still trimmed sample-accurately, as pipeline.md section
 
 ## Known limits (not defects; recorded so they are not rediscovered)
 
-- **HEVC, VC-1, MPEG-4 Part 2** video: timestamps and container frame rate are restored, but
-  bitstream timing fields (HEVC VPS/VUI) are left as they are: confirmed by the round-2 red team,
-  an HEVC output's VUI still declares `vui_time_scale = 25`, `vui_num_units_in_tick = 1` under a
-  24000/1001 container rate. pipeline.md scopes the bitstream rewrite to MPEG-2 and H.264;
-  extending it to HEVC (`hevc_metadata=tick_rate=24000/1001`, read back by trace_headers) is a
-  change to that scope and is put to the architect, not made here.
+- **VC-1, MPEG-4 Part 2** video: timestamps and container frame rate are restored, but any
+  frame rate inside the bitstream is left as it is. (HEVC was in this list until section 8.)
 - **Opus for layouts outside the Vorbis set** is discrete-channel (mapping family 255): every
   channel and its order are kept, but the file carries no speaker labels, so a player may not
   place them. FLAC (the default) keeps every layout with its labels.
@@ -247,3 +243,19 @@ Found while fixing these, also corrected: pitch excerpts on a transport stream w
 far from 0 (the Blu-ray fixture, 600 s) selected no samples, because input `-ss` with `-copyts`
 selects nothing there; the pitch check silently did not run on such files. Excerpts are now
 sought at their time minus the file's start time, without `-copyts`.
+
+## 8. HEVC bitstream frame rate (2026-10-18, the architect's decision)
+
+Round-2 finding 11 (section 7): an HEVC output's VPS and SPS VUI still declared 25 fps. Asked
+whether to convert HEVC to MPEG-2, retime, and convert back, the answer given and accepted was
+no: two lossy encodes break the contract that video is never re-encoded (a test round trip
+changed the decoded frames and lost 10-bit, since MPEG-2 output was 8-bit), and the rewrite is
+available in place. The architect approved extending the rewrite to HEVC.
+
+**Decision:** `hevc_metadata=tick_rate=24000/1001` (HEVC timing counts frames, unlike H.264's
+fields) in `BITSTREAM_FILTERS`; `bitstream_rates` reads every VPS and SPS VUI that carries
+timing, so verification fails an HEVC output still declaring 25 fps (confirmed by running: an
+output retimed by timestamps only reports "bitstream headers declare 25 fps"); `doctor` checks
+the filter. Tested on a 10-bit HDR10 HEVC file: decoded frames bit-identical, colour
+description, mastering-display and content-light-level metadata kept. Permanent tests:
+`hdr.mkv` in the adversarial set, and the HEVC second track of `mixed.ts`.

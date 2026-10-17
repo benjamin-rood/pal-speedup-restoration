@@ -13,7 +13,7 @@ ok() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1: [$2] is false"; fa
 
 frames() { ffmpeg -v error -i "$1" -map "0:v:$2" -f framemd5 - | grep -v '^#' | cut -d, -f6 | md5sum; }
 for pair in mixed.ts dvb.ts dvbbig.ts vobsub.vob late2.vob dvdrip.mkv lead.mkv hires.mkv xvid.avi \
-            edit.mp4 flags.mkv cover.mp4 vp9.webm bluray.m2ts offset10.mkv chapters.mkv l21.mkv; do
+            edit.mp4 flags.mkv cover.mp4 vp9.webm bluray.m2ts offset10.mkv chapters.mkv l21.mkv hdr.mkv; do
   base=${pair%.*}
   [ -f "$R/$base.mkv" ] || { echo "FAIL $base: no output"; fail=1; continue; }
   check "$base frames identical" "$(frames "$F/$pair" 0)" "$(frames "$R/$base.mkv" 0)"
@@ -32,6 +32,24 @@ check "dvb: subtitle track kept" "$(ffprobe -v error -select_streams s -show_ent
 check "vobsub: subtitle track kept" "$(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 "$R/vobsub.mkv")" "dvd_subtitle"
 # The late second DVD audio track was found and probed (sample rate known).
 check "late2: both audio tracks, 48 kHz" "$(ffprobe -v error -select_streams a -show_entries stream=sample_rate -of csv=p=0 "$R/late2.mkv" | paste -sd,)" "48000,48000"
+
+# HEVC: VPS and SPS VUI timing rewritten to 24000/1001 (frame rate = time_scale / num_units_in_tick;
+# 25 fps is 1/25). Read independently of pal_restore.py, from every header of the first packet.
+hevc_timing() { ffmpeg -hide_banner -loglevel debug -i "$1" -map "0:v:$2" -frames:v 1 -c copy \
+  -bsf:v trace_headers -f null - 2>&1 | sed -n 's/^\[trace_headers[^]]*\] *[0-9]* *//p' \
+  | grep -E '^(vps|vui)_(num_units_in_tick|time_scale) ' | awk '{print $1"="$NF}' | sort -u | paste -sd' '; }
+check "hdr: HEVC VPS/VUI timing" "$(hevc_timing "$R/hdr.mkv" 0)" \
+  "vps_num_units_in_tick=1001 vps_time_scale=24000 vui_num_units_in_tick=1001 vui_time_scale=24000"
+check "mixed: HEVC second track VPS/VUI timing" "$(hevc_timing "$R/mixed.mkv" 1)" \
+  "vps_num_units_in_tick=1001 vps_time_scale=24000 vui_num_units_in_tick=1001 vui_time_scale=24000"
+# HDR tags kept: pixel format, colour description, and the mastering display / light level SEI.
+colour() { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_space,color_transfer,color_primaries \
+  -of csv=p=0 "$1"; }
+check "hdr: colour description kept" "$(colour "$R/hdr.mkv")" "yuv420p10le,bt2020nc,smpte2084,bt2020"
+hdrsei() { ffprobe -v error -select_streams v:0 -read_intervals %+#1 -show_entries frame_side_data=side_data_type \
+  -of csv=p=0 "$1" | grep -oE 'Mastering display metadata|Content light level metadata' | sort -u | paste -sd,; }
+check "hdr: mastering display and light level kept" "$(hdrsei "$R/hdr.mkv")" \
+  "Content light level metadata,Mastering display metadata"
 
 # 96 kHz audio keeps its band: energy above 30 kHz within 3 dB of the input's (it was cut at 24 kHz).
 hf() { ffmpeg -v info -nostdin -i "$1" -map 0:a:0 -af highpass=f=30000,highpass=f=30000,volumedetect -f null - 2>&1 \
