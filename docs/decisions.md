@@ -259,3 +259,33 @@ output retimed by timestamps only reports "bitstream headers declare 25 fps"); `
 the filter. Tested on a 10-bit HDR10 HEVC file: decoded frames bit-identical, colour
 description, mastering-display and content-light-level metadata kept. Permanent tests:
 `hdr.mkv` in the adversarial set, and the HEVC second track of `mixed.ts`.
+
+---
+
+# 9. Test coverage added (2026-10-18)
+
+The architect asked whether test coverage could be added and approved four additions.
+
+- **Unit tests** (`tests/test_units.py`, 32 tests, under a second): the subtitle retiming
+  (`retime_text`), millisecond scaling and clock formatting (`_scale_ms`, `_fmt_hms`), line splitting
+  and encoding detection (`_split_lines`, `_read_text`, `retime_sidecar`), the ASS event reader
+  (`ass_event_times`), the resampling filter string (`audio_filter`, for eleven source rates) and the
+  bitstream frame-rate parsing. Expected values are computed in the tests from exact fractions.
+  To make the parsing testable apart from FFmpeg, `bitstream_rates` now hands the `trace_headers` log
+  to a new pure function, `rates_from_trace`; behaviour is unchanged.
+- **A defect the unit tests found: ASS times were rounded twice.** A cue end of 2.000 s scales to
+  2.0854 s, which is 208.54 centiseconds and must print as `0:00:02.09`. The script rounded to 2085 ms
+  first, then rounded 208.5 centiseconds to even, printing `0:00:02.08`: an error of 5.4 ms where
+  rounding once gives at most 5 ms. It was invisible to every verification (the tolerance is 10 ms) and
+  to the suites. Fix: `_scale_ms` takes the stored precision (`unit`, 10 ms for ASS) and rounds once
+  from the exact value; `_fmt_hms` no longer rounds centiseconds, so its carry branch for 995 to 999 ms,
+  which can no longer be reached, is removed. The existing sidecar checks still pass unchanged.
+- **One command** (`tests/run_all.sh`) builds the fixtures, restores them and runs every check, and a
+  GitHub Actions workflow (`.github/workflows/tests.yml`) runs it on every push. The workflow has not
+  been run on GitHub when this was written; it was written to the Ubuntu 24.04 package names.
+- **Two fixtures**: `eac3.mkv` (E-AC-3 5.1, the audio codec of a real WEB-DL episode set, which no
+  fixture used) and `hevc8.mkv` (8-bit HEVC; the earlier HEVC cases were 10-bit HDR10 and the HEVC
+  track of `mixed.ts`). The adversarial set is now 22 files.
+- The new checks can fail: the unit tests run against the previous `pal_restore.py` give 4 failures
+  (the ASS rounding) and 8 errors (functions that did not exist); the `hevc8.mkv` input itself reads
+  `vui_time_scale=25`, so its timing check cannot pass on unrestored video.

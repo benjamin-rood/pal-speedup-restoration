@@ -1,0 +1,16 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install FFmpeg and MKVToolNix
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg mkvtoolnix
+      - name: Run every test suite
+        run: tests/run_all.sh

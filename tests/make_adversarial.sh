@@ -98,6 +98,15 @@ ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" "${X264[@]}" -c:a fla
 ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -filter_complex "[1:a]pan=2.1|FL=c0|FR=c0|LFE=c0[a]" \
   -map 0:v -map "[a]" "${X264[@]}" -c:a ac3 "$out/l21.mkv" &
 
+# eac3.mkv: E-AC-3 (Dolby Digital Plus) 5.1, the audio of most WEB-DL releases, with embedded SRT.
+ffmpeg -v error -y -f lavfi -i "$VID" -f lavfi -i "$CHORD" -filter_complex "[1:a]pan=5.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0[a]" \
+  -map 0:v -map "[a]" "${X264[@]}" -c:a eac3 -b:a 384k "$tmp/e.mkv" &&
+  mkvmerge -q -o "$out/eac3.mkv" "$tmp/e.mkv" --language 0:eng "$tmp/s.srt" &
+
+# hevc8.mkv: 8-bit HEVC (the main-set and hdr.mkv cases are H.264, MPEG-2 and 10-bit HEVC).
+ffmpeg -v error -y -f lavfi -i "$SMALL" -f lavfi -i "$CHORD" -pix_fmt yuv420p -c:v libx265 -preset ultrafast \
+  -x265-params log-level=error -c:a flac "$out/hevc8.mkv" &
+
 # sidecars/: film.mkv and film.part2.mkv (6 s) with adversarial sidecars.
 for name in film film.part2; do
   ffmpeg -v error -y -f lavfi -i "testsrc2=size=320x240:rate=25:duration=6" -f lavfi -i "sine=f=440:d=6" \

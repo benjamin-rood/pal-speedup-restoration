@@ -134,30 +134,11 @@ MPEG2_FRAME_RATES = {1: Fraction(24000, 1001), 2: Fraction(24), 3: Fraction(25),
 _TRACE_LINE = re.compile(r"^\[trace_headers[^]]*\]\s+\d+\s+(\w+)\s.*=\s*(-?\d+)\s*$")
 
 
-def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | None:
-    """Frame rate declared by every sequence-level header of one video track, in stream order.
-
-    H.264: every SPS (in the codec private data and in-band) whose VUI carries timing info;
-    rate = time_scale / (2 * num_units_in_tick). HEVC: every VPS and SPS VUI carrying timing
-    info; rate = time_scale / num_units_in_tick. MPEG-2: every sequence header, with its
-    sequence extension. Returns None for codecs whose headers are not checked.
-    """
-    if codec == "h264":
-        units, start = "7", "seq_parameter_set_id"
-    elif codec == "hevc":
-        units, start = "32|33", "nal_unit_type"
-    elif codec == "mpeg2video":
-        units, start = "0xb3|0xb5", "frame_rate_code"
-    else:
-        return None
-    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "debug", *PROBE, "-i", str(path),
-                        "-map", f"0:v:{vindex}", "-c", "copy",
-                        "-bsf:v", f"filter_units=pass_types={units},trace_headers", "-f", "null", "-"],
-                       env=ENV, capture_output=True, text=True, errors="replace")
-    if p.returncode != 0:
-        raise RuntimeError(f"reading bitstream headers of {path} failed: {p.stderr.strip()[-500:]}")
+def rates_from_trace(codec: str, start: str, trace: str) -> list[Fraction]:
+    """The frame rates declared by the headers in the `trace_headers` log of one video track.
+    `start` is the syntax element that opens a header (see bitstream_rates)."""
     headers: list[dict[str, int]] = []
-    for line in p.stderr.splitlines():
+    for line in trace.splitlines():
         m = _TRACE_LINE.match(line)
         if not m:
             continue
@@ -181,6 +162,31 @@ def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | Non
                 rates.append(rate * (h.get("frame_rate_extension_n", 0) + 1)
                              / (h.get("frame_rate_extension_d", 0) + 1))
     return rates
+
+
+def bitstream_rates(path: Path, vindex: int, codec: str) -> list[Fraction] | None:
+    """Frame rate declared by every sequence-level header of one video track, in stream order.
+
+    H.264: every SPS (in the codec private data and in-band) whose VUI carries timing info;
+    rate = time_scale / (2 * num_units_in_tick). HEVC: every VPS and SPS VUI carrying timing
+    info; rate = time_scale / num_units_in_tick. MPEG-2: every sequence header, with its
+    sequence extension. Returns None for codecs whose headers are not checked.
+    """
+    if codec == "h264":
+        units, start = "7", "seq_parameter_set_id"
+    elif codec == "hevc":
+        units, start = "32|33", "nal_unit_type"
+    elif codec == "mpeg2video":
+        units, start = "0xb3|0xb5", "frame_rate_code"
+    else:
+        return None
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "debug", *PROBE, "-i", str(path),
+                        "-map", f"0:v:{vindex}", "-c", "copy",
+                        "-bsf:v", f"filter_units=pass_types={units},trace_headers", "-f", "null", "-"],
+                       env=ENV, capture_output=True, text=True, errors="replace")
+    if p.returncode != 0:
+        raise RuntimeError(f"reading bitstream headers of {path} failed: {p.stderr.strip()[-500:]}")
+    return rates_from_trace(codec, start, p.stderr)
 
 
 def _clock(t: str) -> float:
@@ -347,17 +353,16 @@ def _read_text(path: Path) -> tuple[str, bytes, str]:
     return data.decode("latin-1"), b"", "latin-1"
 
 
-def _scale_ms(ms: int, ratio: Fraction) -> int:
-    return round(ms * ratio)
+def _scale_ms(ms: int, ratio: Fraction, unit: int = 1) -> int:
+    """`ms` scaled by `ratio`, rounded once to a multiple of `unit` ms (the precision the file stores)."""
+    return round(ms * ratio / unit) * unit
 
 
 def _fmt_hms(ms: int, frac_digits: int, sep: str, min_hour_digits: int, hourless: bool) -> str:
     h, rem = divmod(ms, 3_600_000)
     m, rem = divmod(rem, 60_000)
     s, f = divmod(rem, 1000)
-    frac = f"{f:03}" if frac_digits == 3 else f"{round(f / 10):02}"
-    if frac_digits == 2 and frac == "100":                      # 995..999 ms round up a second
-        return _fmt_hms(ms - f + 1000, frac_digits, sep, min_hour_digits, hourless)
+    frac = f"{f:03}" if frac_digits == 3 else f"{f // 10:02}"     # centiseconds: ms is a multiple of 10
     if hourless and h == 0:
         return f"{m:02}:{s:02}{sep}{frac}"
     return f"{h:0{min_hour_digits}}:{m:02}:{s:02}{sep}{frac}"
@@ -402,7 +407,7 @@ def retime_text(ext: str, text: str, ratio: Fraction) -> str:
                     if tm:
                         lead, h, mi, s, frac, trail = tm.groups()
                         ms = ((int(h) * 60 + int(mi)) * 60 + int(s)) * 1000 + int(frac.ljust(3, "0"))
-                        parts[i] = lead + _fmt_hms(_scale_ms(ms, ratio), 2, ".", 1, False) + trail
+                        parts[i] = lead + _fmt_hms(_scale_ms(ms, ratio, 10), 2, ".", 1, False) + trail
             line = kind + ":" + ",".join(parts) + line[len(body):]
         out.append(line)
     return "".join(out)

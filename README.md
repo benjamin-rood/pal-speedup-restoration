@@ -68,13 +68,13 @@ a batch. If voices sound too low, that source was already pitch-corrected and sh
 ## Tests
 
 ```bash
-tests/make_fixtures.sh /scratch/main && ./pal_restore.py restore /scratch/main && tests/check_outputs.sh /scratch/main
-tests/make_adversarial.sh /scratch/adv && ./pal_restore.py restore /scratch/adv > /scratch/adv/restore.log 2>&1 \
-  && tests/check_adversarial.sh /scratch/adv
-tests/check_cli.sh /scratch/new-dir
+tests/run_all.sh        # every suite from scratch, a few minutes; exits non-zero on any failure
+tests/test_units.py     # just the unit tests of the pure functions, under a second
 ```
 
-See [tests/README.md](tests/README.md) for the full list and what each fixture exercises.
+All use synthetic media generated locally; see [tests/README.md](tests/README.md) for each suite and
+what every fixture exercises. The same command runs on every push in GitHub Actions
+(`.github/workflows/tests.yml`).
 
 ## Status
 

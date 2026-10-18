@@ -13,7 +13,7 @@ ok() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1: [$2] is false"; fa
 
 frames() { ffmpeg -v error -i "$1" -map "0:v:$2" -f framemd5 - | grep -v '^#' | cut -d, -f6 | md5sum; }
 for pair in mixed.ts dvb.ts dvbbig.ts vobsub.vob late2.vob dvdrip.mkv lead.mkv hires.mkv xvid.avi \
-            edit.mp4 flags.mkv cover.mp4 vp9.webm bluray.m2ts offset10.mkv chapters.mkv l21.mkv hdr.mkv; do
+            edit.mp4 flags.mkv cover.mp4 vp9.webm bluray.m2ts offset10.mkv chapters.mkv l21.mkv hdr.mkv eac3.mkv hevc8.mkv; do
   base=${pair%.*}
   [ -f "$R/$base.mkv" ] || { echo "FAIL $base: no output"; fail=1; continue; }
   check "$base frames identical" "$(frames "$F/$pair" 0)" "$(frames "$R/$base.mkv" 0)"
@@ -42,6 +42,13 @@ check "hdr: HEVC VPS/VUI timing" "$(hevc_timing "$R/hdr.mkv" 0)" \
   "vps_num_units_in_tick=1001 vps_time_scale=24000 vui_num_units_in_tick=1001 vui_time_scale=24000"
 check "mixed: HEVC second track VPS/VUI timing" "$(hevc_timing "$R/mixed.mkv" 1)" \
   "vps_num_units_in_tick=1001 vps_time_scale=24000 vui_num_units_in_tick=1001 vui_time_scale=24000"
+check "hevc8: HEVC VPS/VUI timing" "$(hevc_timing "$R/hevc8.mkv" 0)" \
+  "vps_num_units_in_tick=1001 vps_time_scale=24000 vui_num_units_in_tick=1001 vui_time_scale=24000"
+check "hevc8: pixel format kept" "$(ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$R/hevc8.mkv")" "yuv420p"
+# E-AC-3 5.1 becomes 6-channel 48 kHz FLAC with its subtitle track restored too.
+check "eac3: audio is 6-channel 48 kHz FLAC" \
+  "$(ffprobe -v error -select_streams a -show_entries stream=codec_name,sample_rate,channels -of csv=p=0 "$R/eac3.mkv")" "flac,48000,6"
+check "eac3: subtitle track kept" "$(ffprobe -v error -select_streams s -show_entries stream=codec_name -of csv=p=0 "$R/eac3.mkv")" "subrip"
 # HDR tags kept: pixel format, colour description, and the mastering display / light level SEI.
 colour() { ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_space,color_transfer,color_primaries \
   -of csv=p=0 "$1"; }
