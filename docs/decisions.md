@@ -105,10 +105,10 @@ the first video frame is still trimmed sample-accurately, as pipeline.md section
 
 ## 6. Red-team round 1 (2026-10-09): one time base, sidecars as part of the published unit
 
-An independent red-team agent ran 40 adversarial inputs against commit `ff4f58a`. Every finding
+An independent red-team agent ran 40 adversarial inputs against commit `dc3ffa2`. Every finding
 below was confirmed by running it, except where marked. Each is now a permanent test:
 `tests/make_adversarial.sh` + `tests/check_adversarial.sh` (media and sidecars), `tests/check_cli.sh`
-(command line), `tests/failure_path.py` (publishing). Run against `ff4f58a`'s outputs,
+(command line), `tests/failure_path.py` (publishing). Run against `dc3ffa2`'s outputs,
 `check_adversarial.sh` reports 23 failures; against the current code, none.
 
 1. **Tracks on different time bases.** mkvmerge rebases MPEG-TS/PS tracks it reads itself;
@@ -191,10 +191,10 @@ Found while fixing these, also corrected:
 
 ## 7. Red-team round 2 (2026-10-09, the last round allowed): chapters, sidecar encodings, edges
 
-A second independent red-team agent ran about 60 inputs against commit `abd51f6` (about 40
+A second independent red-team agent ran about 60 inputs against commit `74178ed` (about 40
 minutes). All findings were confirmed by running, except LPCM from DVD (`pcm_dvd`) and DVB
 teletext, which it judged by inspection. Each fixed finding is now a permanent test in the
-same scripts as section 6; run against `abd51f6`'s outputs, `check_adversarial.sh` fails every
+same scripts as section 6; run against `74178ed`'s outputs, `check_adversarial.sh` fails every
 new check.
 
 1. **Extra chapter editions with the old 25 fps times, flagged default** (silent: verification
