@@ -8,8 +8,9 @@
 Every original frame is still present in a PAL-speedup release; only the timing and the
 audio were changed. This tool:
 
-  * stretches the video timestamps by 25025/24000 and rewrites the frame rate in H.264 SPS and
-    MPEG-2 sequence headers to 24000/1001, without re-encoding (frames are untouched),
+  * stretches the video timestamps by 25025/24000 and rewrites the frame rate in H.264 and HEVC
+    parameter sets and MPEG-2 sequence headers to 24000/1001, without re-encoding (frames are
+    untouched),
   * resamples every audio track by exactly 24000/25025 (restores both speed and pitch),
   * scales embedded subtitle and chapter times by 25025/24000,
   * scales sidecar subtitle files (.srt/.ass/.ssa/.vtt) next to the input,
