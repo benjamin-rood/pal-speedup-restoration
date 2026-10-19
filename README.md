@@ -79,4 +79,9 @@ what every fixture exercises. The same command runs on every push in GitHub Acti
 ## Status
 
 Tested on synthetic media (all suites pass) and on the first episode of a real 1080p HEVC release,
-which passed every check and was confirmed by ear. There is no licence file yet.
+which passed every check and was confirmed by ear.
+
+## Licence
+
+[MIT](LICENSE). FFmpeg and MKVToolNix are run as separate programs and are not part of this repository;
+each has its own licence.
