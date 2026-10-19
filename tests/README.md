@@ -70,6 +70,6 @@ tests/check_cli.sh /some/new/scratch/dir # must not exist; every line PASS, exit
 `check_outputs.sh` and `check_adversarial.sh` check what `pal_restore.py` does not check about
 itself: decoded frames bit-identical to the input (no re-encode), bitstream timing fields, exact
 sidecar text, audio band, track properties, and the specific defects each adversarial case was
-made for. Run against the outputs of commit `dc3ffa2` (before the round-1 fixes) it reports 23 failures,
-and against `74178ed` (before the round-2 fixes) every check added in round 2 fails, so its
+made for. Run against the outputs of commit `e7e5c64` (before the round-1 fixes) it reports 23 failures,
+and against `c8ba266` (before the round-2 fixes) every check added in round 2 fails, so its
 checks can fail.
